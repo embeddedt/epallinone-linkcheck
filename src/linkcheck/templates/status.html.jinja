@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Easy Peasy Link Check Status</title>
+<style>
+  body { font-family: Georgia, "Times New Roman", Times, serif; padding: 2rem 1rem 4rem; }
+  img.logo { display: block; margin: 0 auto 1rem; }
+  h1, h2 { text-align: center; font-weight: normal; }
+  h1 { margin-bottom: 0.2rem; }
+  h2 { margin-top: 0; font-size: 1.1rem; }
+  p.generated-at { text-align: center; margin-bottom: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin-bottom: 2rem; }
+  th, td { border: 1px solid #999; padding: 4px 8px; text-align: left; vertical-align: top; }
+  th { background: #eee; }
+</style>
+</head>
+<body>
+
+<img class="logo" src="assets/ep-logo.jpg" width="90" height="90" alt="Easy Peasy All-in-One Homeschool logo">
+<h1>Easy Peasy All-in-One Homeschool</h1>
+<h2>Link Check Status</h2>
+<p class="generated-at">Generated <time class="relative-time" datetime="{{ generated_at }}">{{ generated_at }}</time></p>
+
+<h3>Site summary</h3>
+<table>
+  <thead>
+    <tr>
+      <th>Site</th>
+      <th>Total</th>
+      <th>OK</th>
+      <th>Broken</th>
+      <th>Unreachable</th>
+      <th>Pending</th>
+      <th>Watching</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in summaries %}
+    <tr>
+      <td>{{ s.slug }}</td>
+      <td>{{ s.total }}</td>
+      <td>{{ s.ok }}</td>
+      <td>{{ s.broken }}</td>
+      <td>{{ s.unreachable }}</td>
+      <td>{{ s.pending }}</td>
+      <td>{{ s.watching }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h3>Broken / unreachable links ({{ problem_links|length }})</h3>
+{% if not problem_links %}
+<p>No broken or unreachable links.</p>
+{% else %}
+<p>
+  <input type="search" id="search" placeholder="Filter by URL, host, or page title">
+  <button type="button" class="filter-btn active" data-status="all">All</button>
+  <button type="button" class="filter-btn" data-status="broken">Broken</button>
+  <button type="button" class="filter-btn" data-status="unreachable">Unreachable</button>
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Status</th>
+      <th>Result</th>
+      <th>Found on</th>
+      <th>Broken link</th>
+      <th>Failures</th>
+      <th>Last checked</th>
+    </tr>
+  </thead>
+  <tbody id="rows">
+    {% for link in problem_links %}
+    <tr class="row" data-status="{{ link.status }}"
+        data-search="{{ (link.url ~ ' ' ~ link.host ~ ' ' ~ (link.pages|map(attribute='page_title')|join(' ')))|lower }}">
+      <td>{{ link.status }}</td>
+      <td>{{ link|outcome }}</td>
+      <td>
+        {% for page in link.pages %}
+        {{ page.site_slug }}: <a href="{{ page.page_url }}{% if page.day_context %}#{{ page.day_context }}{% endif %}">{{ page.page_title }}</a>{% if page.day_context %}, {{ page.day_context }}{% endif %}{% if page.link_text %} &mdash; &ldquo;{{ page.link_text }}&rdquo;{% endif %}<br>
+        {% endfor %}
+      </td>
+      <td><a href="{{ link.url }}">{{ link.url }}</a></td>
+      <td>{{ link.consecutive_failures }}</td>
+      <td>
+        {% if link.last_checked_at %}
+        <time class="relative-time" datetime="{{ link.last_checked_at }}">{{ link.last_checked_at }}</time>
+        {% else %}
+        never
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if watch_links %}
+<h3>Watching ({{ watch_links|length }})</h3>
+<p>
+  Failed at least one check but not confirmed broken/unreachable yet - could be a
+  transient blip. Will be rechecked automatically; only moves into the list above
+  if it keeps failing.
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Status</th>
+      <th>Result</th>
+      <th>Found on</th>
+      <th>Link</th>
+      <th>Failures</th>
+      <th>Next check</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for link in watch_links %}
+    <tr>
+      <td class="status-watching">watching</td>
+      <td>{{ link|outcome }}</td>
+      <td>
+        {% for page in link.pages %}
+        {{ page.site_slug }}: <a href="{{ page.page_url }}{% if page.day_context %}#{{ page.day_context }}{% endif %}">{{ page.page_title }}</a>{% if page.day_context %}, {{ page.day_context }}{% endif %}{% if page.link_text %} &mdash; &ldquo;{{ page.link_text }}&rdquo;{% endif %}<br>
+        {% endfor %}
+      </td>
+      <td><a href="{{ link.url }}">{{ link.url }}</a></td>
+      <td>{{ link.consecutive_failures }}</td>
+      <td><time class="relative-time" datetime="{{ link.next_check_at }}">{{ link.next_check_at }}</time></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<script>
+(function () {
+  var search = document.getElementById("search");
+  var buttons = document.querySelectorAll(".filter-btn");
+  var rows = document.querySelectorAll(".row");
+  var activeStatus = "all";
+
+  function applyFilters() {
+    var q = (search.value || "").toLowerCase();
+    rows.forEach(function (row) {
+      var matchesStatus = activeStatus === "all" || row.dataset.status === activeStatus;
+      var matchesSearch = !q || row.dataset.search.indexOf(q) !== -1;
+      row.style.display = matchesStatus && matchesSearch ? "" : "none";
+    });
+  }
+
+  if (search) {
+    search.addEventListener("input", applyFilters);
+    buttons.forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        buttons.forEach(function (b) { b.classList.remove("active"); });
+        btn.classList.add("active");
+        activeStatus = btn.dataset.status;
+        applyFilters();
+      });
+    });
+  }
+
+  function formatRelative(iso) {
+    var diffMs = new Date(iso).getTime() - Date.now();
+    var sec = Math.round(Math.abs(diffMs) / 1000);
+    var units = [["day", 86400], ["hour", 3600], ["minute", 60], ["second", 1]];
+    for (var i = 0; i < units.length; i++) {
+      var amount = Math.floor(sec / units[i][1]);
+      if (amount >= 1 || i === units.length - 1) {
+        var label = units[i][0] + (amount === 1 ? "" : "s");
+        return diffMs >= 0 ? "in " + amount + " " + label : amount + " " + label + " ago";
+      }
+    }
+  }
+
+  document.querySelectorAll(".relative-time").forEach(function (el) {
+    el.textContent = formatRelative(el.getAttribute("datetime"));
+    el.title = el.getAttribute("datetime");
+  });
+})();
+</script>
+
+</body>
+</html>

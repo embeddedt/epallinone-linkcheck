@@ -1,0 +1,42 @@
+[Unit]
+Description=linkcheck background worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=linkcheck
+Group=linkcheck
+WorkingDirectory=/opt/linkcheck
+
+# Auto-creates /var/lib/linkcheck (owned by User=/Group=) on start and
+# includes it in the sandbox's writable paths - no manual mkdir/chown needed.
+StateDirectory=linkcheck
+
+# Dashboard template references assets/ep-logo.jpg relative to the dashboard file, so
+# the logo has to live alongside it under the state dir too - re-synced on every start
+# so a redeploy (new logo, moved asset) doesn't need a separate manual copy step.
+ExecStartPre=/usr/bin/install -D -m 644 \
+    /opt/linkcheck/public/assets/ep-logo.jpg \
+    /var/lib/linkcheck/public/assets/ep-logo.jpg
+
+ExecStart=/opt/linkcheck/.venv/bin/linkcheck run \
+    --db-path /var/lib/linkcheck/linkcheck.db \
+    --dashboard-path /var/lib/linkcheck/public/status.html
+
+Restart=on-failure
+RestartSec=10
+
+# Shutdown is only honored between crawl/check cycles, not mid-batch (see
+# scheduler.py) - a check batch can take a couple minutes in the worst case
+# (many slow/timing-out hosts), so give it real room before SIGKILL.
+TimeoutStopSec=180
+
+# Sandboxing
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,302 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
+from linkcheck import db, report
+from linkcheck.checker import CheckResult, get_due_links, record_check
+from linkcheck.config import UNCONFIRMED_RETRY_MINUTES
+from linkcheck.crawler import CoursePage, ExtractedLink, sync_course_page
+
+
+@pytest.fixture
+def conn():
+    connection = db.connect(":memory:")
+    db.init_db(connection)
+    yield connection
+    connection.close()
+
+
+def _sync(conn, site_slug, slug, url, links):
+    page = CoursePage(wp_id=1, slug=slug, canonical_url=url, title=slug.replace("-", " ").title(), html="")
+    sync_course_page(conn, site_slug, page, links)
+
+
+def _check_all_due(conn, result: CheckResult, now: datetime | None = None):
+    now = now or datetime.now(UTC)
+    for link in get_due_links(conn, now, batch_size=1000):
+        record_check(conn, link, result, now)
+
+
+def _confirm_broken(conn, result: CheckResult = CheckResult(404, None, 10)):
+    """Drive a link through the full unconfirmed-retry schedule to a confirmed status,
+    advancing the clock between checks so each retry is actually due (mirrors the
+    pattern in test_checker_db.py).
+    """
+    now = datetime.now(UTC)
+    for _ in range(len(UNCONFIRMED_RETRY_MINUTES) + 1):
+        _check_all_due(conn, result, now)
+        now += timedelta(days=999)
+
+
+def test_get_site_summaries_counts_by_status(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/broken", text="a", day_context="day1")],
+    )
+    _confirm_broken(conn)
+
+    summaries = {s.slug: s for s in report.get_site_summaries(conn)}
+    assert summaries["homeschool"].broken == 1
+    assert summaries["homeschool"].total == 1
+    assert summaries["highschool"].total == 0  # site with no crawled pages yet
+
+
+def test_get_problem_links_excludes_ok_and_pending(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [
+            ExtractedLink(url="https://ext.example.com/ok", text="ok", day_context=None),
+            ExtractedLink(url="https://ext.example.com/pending", text="pending", day_context=None),
+        ],
+    )
+    now = datetime.now(UTC)
+    due = get_due_links(conn, now, batch_size=1000)
+    ok_link = next(link for link in due if link.url.endswith("/ok"))
+    record_check(conn, ok_link, CheckResult(200, None, 10), now)
+    # leave /pending untouched -> stays status='pending'
+
+    problem_links = report.get_problem_links(conn)
+    assert problem_links == []
+
+
+def test_get_problem_links_includes_page_context(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/broken", text="link text", day_context="day5")],
+    )
+    _confirm_broken(conn)
+
+    problem_links = report.get_problem_links(conn)
+    assert len(problem_links) == 1
+    link = problem_links[0]
+    assert link.status == "broken"
+    assert link.last_http_status == 404
+    assert len(link.pages) == 1
+    assert link.pages[0].site_slug == "homeschool"
+    assert link.pages[0].day_context == "day5"
+    assert link.pages[0].page_title == "Math 1"
+
+
+def test_get_problem_links_shared_link_lists_every_page(conn):
+    shared = ExtractedLink(url="https://ext.example.com/shared", text="shared", day_context=None)
+    _sync(conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/", [shared])
+    _sync(conn, "homeschool", "math-2", "https://allinonehomeschool.com/math-2/", [shared])
+
+    _confirm_broken(conn)
+
+    problem_links = report.get_problem_links(conn)
+    assert len(problem_links) == 1
+    assert {p.page_title for p in problem_links[0].pages} == {"Math 1", "Math 2"}
+
+
+def test_get_watch_links_includes_first_failure_not_yet_confirmed(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/flaky", text="flaky", day_context="day2")],
+    )
+    _check_all_due(conn, CheckResult(404, None, 10))  # single failure, unconfirmed
+
+    assert report.get_problem_links(conn) == []  # not confirmed -> not a "problem" yet
+    watch_links = report.get_watch_links(conn)
+    assert len(watch_links) == 1
+    link = watch_links[0]
+    assert link.url == "https://ext.example.com/flaky"
+    assert link.consecutive_failures == 1
+    assert link.status == "pending"  # underlying status unchanged, per next_state()
+    assert link.pages[0].day_context == "day2"
+
+
+def test_get_watch_links_excludes_orphaned_links(conn):
+    # A link that failed a check and then lost every page association (e.g. the
+    # course page was recrawled and no longer contains it) is also excluded from the
+    # check queue going forward - so without this filter it would sit in "watching"
+    # forever with no page to point at and no future check that could ever confirm
+    # or clear it. See report._link_rows.
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/flaky", text="flaky", day_context=None)],
+    )
+    _check_all_due(conn, CheckResult(404, None, 10))  # single failure, unconfirmed
+    assert len(report.get_watch_links(conn)) == 1
+
+    link_id = conn.execute("SELECT id FROM links").fetchone()["id"]
+    conn.execute("DELETE FROM page_links WHERE link_id = ?", (link_id,))
+    conn.commit()
+
+    assert report.get_watch_links(conn) == []
+
+
+def test_get_problem_links_excludes_orphaned_links(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/broken", text="broken", day_context=None)],
+    )
+    _confirm_broken(conn)
+    assert len(report.get_problem_links(conn)) == 1
+
+    link_id = conn.execute("SELECT id FROM links").fetchone()["id"]
+    conn.execute("DELETE FROM page_links WHERE link_id = ?", (link_id,))
+    conn.commit()
+
+    assert report.get_problem_links(conn) == []
+
+
+def test_get_watch_links_excludes_confirmed_and_healthy_links(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [
+            ExtractedLink(url="https://ext.example.com/broken", text="broken", day_context=None),
+            ExtractedLink(url="https://ext.example.com/ok", text="ok", day_context=None),
+        ],
+    )
+    now = datetime.now(UTC)
+    for _ in range(len(UNCONFIRMED_RETRY_MINUTES) + 1):
+        for link in get_due_links(conn, now, batch_size=1000):
+            result = CheckResult(404, None, 10) if "broken" in link.url else CheckResult(200, None, 10)
+            record_check(conn, link, result, now)
+        now += timedelta(days=999)
+
+    assert report.get_watch_links(conn) == []  # one confirmed broken, one steadily ok
+
+
+def test_get_site_summaries_watching_count(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/flaky", text="flaky", day_context=None)],
+    )
+    _check_all_due(conn, CheckResult(404, None, 10))
+
+    summaries = {s.slug: s for s in report.get_site_summaries(conn)}
+    assert summaries["homeschool"].watching == 1
+    assert summaries["homeschool"].pending == 1  # still counted under its real status too
+
+
+def test_get_check_progress_counts_checked_vs_total(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [
+            ExtractedLink(url="https://ext.example.com/checked", text="a", day_context=None),
+            ExtractedLink(url="https://ext.example.com/pending", text="b", day_context=None),
+        ],
+    )
+    now = datetime.now(UTC)
+    due = get_due_links(conn, now, batch_size=1000)
+    checked_link = next(link for link in due if link.url.endswith("/checked"))
+    record_check(conn, checked_link, CheckResult(200, None, 10), now)
+    # leave /pending untouched
+
+    progress = report.get_check_progress(conn)
+    assert progress.checked == 1
+    assert progress.total == 2
+    assert progress.pct == 50.0
+
+
+def test_get_check_progress_excludes_orphaned_links(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/gone", text="a", day_context=None)],
+    )
+    link_id = conn.execute("SELECT id FROM links").fetchone()["id"]
+    conn.execute("DELETE FROM page_links WHERE link_id = ?", (link_id,))
+    conn.commit()
+
+    progress = report.get_check_progress(conn)
+    assert progress.total == 0  # orphaned link isn't part of the checkable population
+    assert progress.pct == 0.0  # no division by zero
+
+
+def test_render_text_report_no_problems(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/ok", text="ok", day_context=None)],
+    )
+    _check_all_due(conn, CheckResult(200, None, 10))
+
+    text = report.render_text_report(
+        report.get_site_summaries(conn), report.get_problem_links(conn), report.get_watch_links(conn)
+    )
+    assert "No broken or unreachable links." in text
+    assert "homeschool" in text
+
+
+def test_render_text_report_lists_problems(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/broken", text="a", day_context="day3")],
+    )
+    _confirm_broken(conn)
+
+    text = report.render_text_report(
+        report.get_site_summaries(conn), report.get_problem_links(conn), report.get_watch_links(conn)
+    )
+    assert "https://ext.example.com/broken" in text
+    assert "day3" in text
+    assert "broken" in text
+
+
+def test_render_text_report_lists_watching(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/flaky", text="a", day_context="day7")],
+    )
+    _check_all_due(conn, CheckResult(404, None, 10))
+
+    text = report.render_text_report(
+        report.get_site_summaries(conn), report.get_problem_links(conn), report.get_watch_links(conn)
+    )
+    assert "watching" in text
+    assert "https://ext.example.com/flaky" in text
+    assert "day7" in text
+
+
+def test_render_html_report_contains_expected_content(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/broken", text="a", day_context="day3")],
+    )
+    _confirm_broken(conn)
+
+    html = report.render_html_report(
+        report.get_site_summaries(conn),
+        report.get_problem_links(conn),
+        report.get_watch_links(conn),
+        "2026-01-01T00:00:00",
+    )
+    assert "<html" in html
+    assert "https://ext.example.com/broken" in html
+    assert "Math 1" in html
+    assert "2026-01-01T00:00:00" in html
+
+
+def test_render_html_report_shows_watching_section(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/flaky", text="a", day_context=None)],
+    )
+    _check_all_due(conn, CheckResult(404, None, 10))
+
+    html = report.render_html_report(
+        report.get_site_summaries(conn),
+        report.get_problem_links(conn),
+        report.get_watch_links(conn),
+        "2026-01-01T00:00:00",
+    )
+    assert "Watching" in html
+    assert "https://ext.example.com/flaky" in html
+    assert "status-watching" in html
+
+
+def test_render_html_report_empty_state(conn):
+    html = report.render_html_report([], [], [], "2026-01-01T00:00:00")
+    assert "No broken or unreachable links." in html
+    assert "Watching (" not in html  # section itself is skipped; summary column header still says "Watching"
