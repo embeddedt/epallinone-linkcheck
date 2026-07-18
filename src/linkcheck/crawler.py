@@ -249,7 +249,15 @@ _LABEL_SIBLING_SEARCH_LIMIT = 5  # how many following siblings to check for an e
 
 
 def _strong_labels(elements) -> list[str]:
-    return [text for el in elements if (strong := el.find("strong")) and (text := _visible_text(strong))]
+    """Text of each element's title `<strong>` - either the element itself (a `<strong>`
+    that's a direct child of the day marker, no wrapper) or a `<strong>` nested inside it
+    (the far more common `<p><strong>Lesson N</strong></p>` shape).
+    """
+    return [
+        text
+        for el in elements
+        if (strong := el if el.name == "strong" else el.find("strong")) and (text := _visible_text(strong))
+    ]
 
 
 def _day_label(node: Tag) -> str | None:
@@ -259,9 +267,10 @@ def _day_label(node: Tag) -> str | None:
 
     Course pages mark a day several different ways:
     - directly on the id-bearing tag itself (`<strong id="dayN">Lesson N</strong>`)
-    - on a wrapping `<div id="dayN">` whose title lives in a `<strong>` inside one of
-      its direct-child block elements (a `<p>` on most pages, a bare `<div>` on at
-      least one course)
+    - on a wrapping `<div id="dayN">` whose title `<strong>` is itself a direct child
+      (`<div id="dayN"><strong>Lesson N</strong> <ol>...`), or nested one level inside
+      a direct-child block element (a `<p>` on most pages, a bare `<div>` on at least
+      one course)
     - on an empty marker element (`<div id="dayN"></div>`) whose title is actually in
       a handful of *sibling* elements right after it, not a descendant at all
 

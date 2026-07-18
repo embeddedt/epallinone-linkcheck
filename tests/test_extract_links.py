@@ -159,6 +159,20 @@ def test_extract_links_day_label_sibling_search_does_not_cross_into_next_day():
     assert links[0].day_label is None
 
 
+def test_extract_links_day_label_strong_is_direct_child_of_marker():
+    # real markup seen on drawing-and-painting: the title <strong> is a direct child of
+    # the id-bearing div, not wrapped in a <p> - must not be missed in favor of None
+    html = """
+    <div id="day42"><strong>Lesson 42<br/> </strong>
+      <ol>
+        <li><a href="https://ext.example.com/a">a</a></li>
+      </ol>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_label == "Lesson 42"
+
+
 def test_extract_links_day_label_supports_legacy_day_n_convention():
     # "Day N" was the naming convention on some courses years ago, before "Lesson N" -
     # not seen live anymore, but the label regex still recognizes it defensively
