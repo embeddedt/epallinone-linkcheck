@@ -114,7 +114,7 @@
         {% if entry.link_text %}&ldquo;{% if entry.context_before %}&hellip;{{ entry.context_before }} {% endif %}<strong>{{ entry.link_text }}</strong>{% if entry.context_after %} {{ entry.context_after }}&hellip;{% endif %}&rdquo;{% endif %}
         (<a href="{{ found_on_href(group, entry) }}" target="_blank" rel="noopener noreferrer">{% if entry.day_context %}{{ entry.day_context }}{% else %}view on page{% endif %}</a>)
       </td>
-      <td><a href="{{ entry.link.url }}">{{ entry.link.url }}</a></td>
+      <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
       <td>{{ entry.link.consecutive_failures }}</td>
       <td>
         {% if entry.link.last_checked_at %}
@@ -169,7 +169,7 @@
         {% if entry.link_text %}&ldquo;{% if entry.context_before %}&hellip;{{ entry.context_before }} {% endif %}<strong>{{ entry.link_text }}</strong>{% if entry.context_after %} {{ entry.context_after }}&hellip;{% endif %}&rdquo;{% endif %}
         (<a href="{{ found_on_href(group, entry) }}" target="_blank" rel="noopener noreferrer">{% if entry.day_context %}{{ entry.day_context }}{% else %}view on page{% endif %}</a>)
       </td>
-      <td><a href="{{ entry.link.url }}">{{ entry.link.url }}</a></td>
+      <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
       <td>{{ entry.link.consecutive_failures }}</td>
       <td><time class="relative-time" datetime="{{ entry.link.next_check_at }}">{{ entry.link.next_check_at }}</time></td>
     </tr>
