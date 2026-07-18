@@ -28,6 +28,11 @@ def test_extract_links_div_variant_ep_math_1():
     # at least some links carry a day_context
     assert any(link.day_context is not None for link in links)
 
+    # the div wraps a "Lesson N" heading, not "day1" - the friendly label should
+    # reflect that heading
+    day1_links = [link for link in links if link.day_context == "day1"]
+    assert day1_links and all(link.day_label == "Lesson 1" for link in day1_links)
+
 
 def test_extract_links_strong_variant_algebra_1():
     page = _load("highschool_algebra-1-2023-update.json")
@@ -46,6 +51,10 @@ def test_extract_links_strong_variant_algebra_1():
 
     # day_context capture also works with <strong id="dayN"> markers, not just <div>
     assert any(link.day_context is not None for link in links)
+
+    # the id sits directly on the <strong> holding the lesson title itself
+    day2_links = [link for link in links if link.day_context == "day2"]
+    assert day2_links and all(link.day_label == "Lesson 2" for link in day2_links)
 
 
 def test_extract_links_drops_fragments_mailto_and_javascript():
@@ -81,6 +90,86 @@ def test_extract_links_day_context_tracks_nearest_preceding_marker():
     by_url = {link.url: link.day_context for link in links}
     assert by_url["https://ext.example.com/a"] == "day1"
     assert by_url["https://ext.example.com/b"] == "day2"
+
+
+def test_extract_links_day_label_prefers_lesson_heading_over_topic_heading():
+    # some course pages put a topic heading (e.g. "Addition") in its own <strong>
+    # before the actual "Lesson N" one - the lesson-numbered candidate should win
+    html = """
+    <div id="day16">
+      <p><strong>Addition</strong></p>
+      <p><strong>Lesson 16</strong></p>
+      <a href="https://ext.example.com/a">a</a>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_label == "Lesson 16"
+
+
+def test_extract_links_day_label_trims_trailing_boilerplate():
+    # e.g. "Lesson 3* (Note that an asterisk * indicates there is a worksheet)" - only
+    # the "Lesson N" portion itself is a useful label, not the repeated boilerplate
+    html = """
+    <div id="day3">
+      <p><strong>Lesson 3* (Note that an asterisk * indicates there is a worksheet)</strong></p>
+      <a href="https://ext.example.com/a">a</a>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_label == "Lesson 3*"
+
+
+def test_extract_links_day_label_ignores_unrelated_numbers_inside_the_lesson_body():
+    # a real mismatch seen in the wild: a day marker with no heading of its own, whose
+    # body links to some *other* book's "lesson 1" - flattening the marker's entire
+    # text (heading search included) would wrongly pick that up as this day's title
+    html = """
+    <div id="day53">
+      <ol>
+        <li>Read <a href="https://ext.example.com/book">lesson 1</a> in your new book!</li>
+      </ol>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_label is None
+
+
+def test_extract_links_day_label_falls_back_to_following_siblings():
+    # a real markup quirk seen in the wild: an empty id-bearing marker with the actual
+    # title in a handful of sibling elements right after it, not a descendant at all
+    html = """
+    <div id="day134"></div>
+    <p><strong>Lesson 134</strong></p>
+    <a href="https://ext.example.com/a">a</a>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_label == "Lesson 134"
+
+
+def test_extract_links_day_label_sibling_search_does_not_cross_into_next_day():
+    # day1's marker is empty with no title anywhere in it - the sibling fallback must
+    # not walk past day2's own marker and borrow *its* title
+    html = """
+    <div id="day1"></div>
+    <a href="https://ext.example.com/a">a</a>
+    <div id="day2"><p><strong>Lesson 2</strong></p></div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_context == "day1"
+    assert links[0].day_label is None
+
+
+def test_extract_links_day_label_supports_legacy_day_n_convention():
+    # "Day N" was the naming convention on some courses years ago, before "Lesson N" -
+    # not seen live anymore, but the label regex still recognizes it defensively
+    html = """
+    <div id="day9">
+      <p><strong>Day 9</strong></p>
+      <a href="https://ext.example.com/a">a</a>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links[0].day_label == "Day 9"
 
 
 def test_extract_links_drops_day_context_when_id_repeats_on_page():

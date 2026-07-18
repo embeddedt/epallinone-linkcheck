@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS page_links (
     page_id INTEGER NOT NULL REFERENCES pages(id),
     link_id INTEGER NOT NULL REFERENCES links(id),
     day_context TEXT,                      -- best-effort nearest id="dayN"; nullable
+    day_label TEXT,                        -- friendly title for day_context (e.g. "Lesson 47"); nullable
     link_text TEXT,                        -- anchor text, for readable reports
     context_before TEXT,                   -- best-effort prose immediately before the link
     context_after TEXT,                    -- best-effort prose immediately after the link

@@ -24,6 +24,7 @@ CONTENT_SELECTOR = ".entry-content"
 DAY_ID_RE = re.compile(r"^day\d+$", re.IGNORECASE)
 _MISSING_SLASH_RE = re.compile(r"^(https?):/(?!/)", re.IGNORECASE)
 _WHITESPACE_RE = re.compile(r"\s+")
+_DAY_TITLE_RE = re.compile(r"(?:lesson|day)\s*\d+\*?", re.IGNORECASE)
 
 
 def _visible_text(tag: Tag) -> str:
@@ -190,6 +191,7 @@ class ExtractedLink:
     day_context: str | None
     context_before: str | None = None
     context_after: str | None = None
+    day_label: str | None = None
 
 
 CONTEXT_CHARS = 60  # how much surrounding prose to keep on each side, best-effort
@@ -242,6 +244,73 @@ def _link_context(node: Tag) -> tuple[str | None, str | None]:
     )
 
 
+_LABEL_STOP_TAGS = {"ol", "ul"}  # numbered/bulleted lesson body starts here - stop scanning for a title past it
+_LABEL_SIBLING_SEARCH_LIMIT = 5  # how many following siblings to check for an empty id marker, see below
+
+
+def _strong_labels(elements) -> list[str]:
+    return [text for el in elements if (strong := el.find("strong")) and (text := _visible_text(strong))]
+
+
+def _day_label(node: Tag) -> str | None:
+    """Best-effort human-friendly title for a day/lesson marker (e.g. "Lesson 47" -
+    or "Day 47" on courses still using that older naming convention), for display
+    in reports in place of the raw "day47" id.
+
+    Course pages mark a day several different ways:
+    - directly on the id-bearing tag itself (`<strong id="dayN">Lesson N</strong>`)
+    - on a wrapping `<div id="dayN">` whose title lives in a `<strong>` inside one of
+      its direct-child block elements (a `<p>` on most pages, a bare `<div>` on at
+      least one course)
+    - on an empty marker element (`<div id="dayN"></div>`) whose title is actually in
+      a handful of *sibling* elements right after it, not a descendant at all
+
+    Some pages put a topic heading (e.g. "Addition") in its own `<strong>` before the
+    actual "Lesson N" one, so the first candidate matching "Lesson N"/"Day N" is
+    preferred over whichever comes first - scanning stops at the first `<ol>`/`<ul>`,
+    since that's where the numbered lesson body (with its own unrelated bold text and,
+    on some pages, unrelated numbers - e.g. a link to an external "lesson 1" of some
+    other book) begins, and the sibling search additionally stops at the next day
+    marker so it never borrows a title from the following day. Trims off any trailing
+    boilerplate parenthetical (e.g. "* (Note that an asterisk indicates ...)") by
+    keeping only the matched "Lesson N"/"Day N" substring.
+
+    `node`'s own flattened text is only trusted directly when the marker itself has no
+    `<ol>`/`<ul>` anywhere inside it (a short marker: just the id-bearing tag itself,
+    or a small wrapper holding only the title) - when the marker wraps the day's whole
+    body, flattening it would search the exercises' text too, and a stray "lesson 1" or
+    "day 3" in there (an external link's own numbering, unrelated to this day) would be
+    mistaken for the day's own title.
+    """
+    own_text = _visible_text(node)
+    if own_text and node.find(list(_LABEL_STOP_TAGS)) is None:
+        candidates = [own_text]
+    else:
+        children = []
+        for child in node.find_all(recursive=False):
+            if child.name in _LABEL_STOP_TAGS:
+                break
+            children.append(child)
+        candidates = _strong_labels(children)
+
+    if not candidates:
+        siblings = []
+        for sibling in node.find_next_siblings(limit=_LABEL_SIBLING_SEARCH_LIMIT):
+            if sibling.name in _LABEL_STOP_TAGS:
+                break
+            sibling_id = sibling.get("id")
+            if sibling_id and DAY_ID_RE.match(sibling_id):
+                break
+            siblings.append(sibling)
+        candidates = _strong_labels(siblings)
+
+    for candidate in candidates:
+        match = _DAY_TITLE_RE.search(candidate)
+        if match:
+            return match.group()
+    return candidates[0] if candidates else None
+
+
 def extract_links(html: str, page_url: str, site_base_url: str) -> list[ExtractedLink]:
     """Pull every external link out of a course page's rendered body.
 
@@ -272,6 +341,7 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     day_id_counts = Counter(node.get("id") for node in soup.find_all(id=DAY_ID_RE))
 
     current_day: str | None = None
+    current_day_label: str | None = None
     seen: dict[str, ExtractedLink] = {}
     for node in soup.descendants:
         if not isinstance(node, Tag):
@@ -279,6 +349,7 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         node_id = node.get("id")
         if node_id and DAY_ID_RE.match(node_id):
             current_day = node_id
+            current_day_label = _day_label(node)
         if node.name != "a":
             continue
         href = (node.get("href") or "").strip()
@@ -297,6 +368,7 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
                 day_context=day_context,
                 context_before=context_before,
                 context_after=context_after,
+                day_label=current_day_label if day_context else None,
             ),
         )
     return list(seen.values())
@@ -408,11 +480,12 @@ def sync_course_page(
             conn.execute(
                 """
                 INSERT INTO page_links
-                    (page_id, link_id, day_context, link_text, context_before, context_after, last_seen_at)
+                    (page_id, link_id, day_context, day_label, link_text, context_before, context_after, last_seen_at)
                 VALUES
-                    (:page_id, :link_id, :day_context, :link_text, :context_before, :context_after, :now)
+                    (:page_id, :link_id, :day_context, :day_label, :link_text, :context_before, :context_after, :now)
                 ON CONFLICT(page_id, link_id) DO UPDATE SET
                     day_context = excluded.day_context,
+                    day_label = excluded.day_label,
                     link_text = excluded.link_text,
                     context_before = excluded.context_before,
                     context_after = excluded.context_after,
@@ -422,6 +495,7 @@ def sync_course_page(
                     "page_id": page_id,
                     "link_id": link_id,
                     "day_context": link.day_context,
+                    "day_label": link.day_label,
                     "link_text": link.text,
                     "context_before": link.context_before,
                     "context_after": link.context_after,

@@ -47,6 +47,7 @@ class PageRef:
     page_title: str
     page_url: str
     day_context: str | None
+    day_label: str | None
     link_text: str | None
     context_before: str | None
     context_after: str | None
@@ -70,6 +71,7 @@ class LinkReportRow:
 class PageGroupEntry:
     link: LinkReportRow
     day_context: str | None
+    day_label: str | None
     link_text: str | None
     context_before: str | None
     context_after: str | None
@@ -98,6 +100,7 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
                 PageGroupEntry(
                     link=link,
                     day_context=page.day_context,
+                    day_label=page.day_label,
                     link_text=page.link_text,
                     context_before=page.context_before,
                     context_after=page.context_after,
@@ -190,6 +193,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
     page_rows = conn.execute(
         f"""
         SELECT page_links.link_id AS link_id, page_links.day_context AS day_context,
+               page_links.day_label AS day_label,
                page_links.link_text AS link_text,
                page_links.context_before AS context_before,
                page_links.context_after AS context_after,
@@ -211,6 +215,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
                 page_title=row["page_title"],
                 page_url=row["page_url"],
                 day_context=row["day_context"],
+                day_label=row["day_label"],
                 link_text=row["link_text"],
                 context_before=row["context_before"],
                 context_after=row["context_after"],
@@ -401,7 +406,7 @@ def render_text_report(
                 f"  [{link.status:>11}] {_outcome(link):>5} (x{link.consecutive_failures}) {link.url}"
             )
             for page in link.pages:
-                day = f", {page.day_context}" if page.day_context else ""
+                day = f", {page.day_label or page.day_context}" if page.day_context else ""
                 text = f' — "{page.link_text}"' if page.link_text else ""
                 lines.append(f"      on {page.site_slug}: {page.page_title!r}{day}{text}")
 
@@ -417,7 +422,7 @@ def render_text_report(
                 f"{link.url}  next check: {link.next_check_at}"
             )
             for page in link.pages:
-                day = f", {page.day_context}" if page.day_context else ""
+                day = f", {page.day_label or page.day_context}" if page.day_context else ""
                 text = f' — "{page.link_text}"' if page.link_text else ""
                 lines.append(f"      on {page.site_slug}: {page.page_title!r}{day}{text}")
 

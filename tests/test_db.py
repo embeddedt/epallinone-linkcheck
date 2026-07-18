@@ -50,7 +50,7 @@ def test_init_db_migrates_existing_page_links_table_missing_context_columns():
     db.init_db(conn)
 
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(page_links)")}
-    assert {"context_before", "context_after"} <= columns
+    assert {"context_before", "context_after", "day_label"} <= columns
 
     row = conn.execute("SELECT * FROM page_links").fetchone()
     assert row["link_text"] == "source"  # pre-existing data survives the migration
