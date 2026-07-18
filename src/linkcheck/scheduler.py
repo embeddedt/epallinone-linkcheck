@@ -49,12 +49,18 @@ async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
         pass
 
 
-async def crawl_loop(conn: sqlite3.Connection, stop_event: asyncio.Event) -> None:
+async def crawl_loop(
+    conn: sqlite3.Connection, stop_event: asyncio.Event, dashboard_path: str
+) -> None:
     """Recrawl all course pages for both sites, then wait for the next cycle.
 
     Runs once immediately on startup. A shutdown request is only honored between
     cycles, not mid-crawl - a full crawl is on the order of a hundred course-page
     fetches, so this keeps the loop simple without cancellation plumbing.
+
+    Also regenerates the dashboard once a full pass finishes, same as check_loop -
+    otherwise freshly-crawled data (new links, updated day labels, ...) wouldn't show
+    up until check_loop's own next tick, up to CHECK_LOOP_INTERVAL_SECONDS later.
     """
     async with httpx.AsyncClient(
         timeout=CRAWL_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}
@@ -71,6 +77,10 @@ async def crawl_loop(conn: sqlite3.Connection, stop_event: asyncio.Event) -> Non
                     continue
                 found = sum(1 for r in results if r.found)
                 logger.info("%s: crawled %d/%d course pages", site.slug, found, len(results))
+            try:
+                _write_dashboard(conn, dashboard_path)
+            except Exception:
+                logger.exception("Failed to regenerate dashboard after crawl")
             await _sleep_or_stop(stop_event, CRAWL_INTERVAL_HOURS * 3600)
 
 
@@ -182,7 +192,7 @@ async def run(db_path: str, dashboard_path: str = DASHBOARD_HTML_PATH) -> None:
         # from under check tasks still in flight. Each loop is individually resilient; this
         # is the backstop for anything that slips through.
         results = await asyncio.gather(
-            crawl_loop(conn, stop_event),
+            crawl_loop(conn, stop_event, dashboard_path),
             check_loop(conn, stop_event, dashboard_path),
             progress_loop(conn, stop_event),
             return_exceptions=True,
