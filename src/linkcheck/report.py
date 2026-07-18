@@ -14,7 +14,7 @@ from urllib.parse import quote
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from linkcheck import checker
-from linkcheck.config import never_check_host_clause
+from linkcheck.config import never_check_host_clause, source_citation_link_clause
 
 NOT_OK_STATUSES = ("broken", "unreachable")
 
@@ -134,6 +134,7 @@ def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
     site_slugs = [row["slug"] for row in conn.execute("SELECT slug FROM sites ORDER BY slug")]
 
     never_clause, never_params = never_check_host_clause("links.host")
+    source_clause, source_params = source_citation_link_clause("links.id")
     notok_placeholders, notok_params = _named_in("notok", NOT_OK_STATUSES)
 
     # One grouped pass over the site<->link join: per-status counts and the separate
@@ -155,9 +156,10 @@ def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
         JOIN links ON links.id = page_links.link_id
         WHERE 1=1
           {never_clause}
+          {source_clause}
         GROUP BY sites.slug
         """,
-        {**notok_params, **never_params},
+        {**notok_params, **never_params, **source_params},
     ).fetchall()
     by_slug = {row["slug"]: row for row in rows}
 
@@ -285,17 +287,23 @@ def _link_rows(
     last check before losing its page(s) would sit in the watching/broken lists
     forever with nothing to click through to and no future check that could ever
     confirm or clear it.
+
+    Also excludes source-citation links (see source_citation_link_clause) - a link
+    used purely as a "here's where we got this from" attribution isn't something
+    anyone needs to fix.
     """
     never_clause, never_params = never_check_host_clause("host")
+    source_clause, source_params = source_citation_link_clause("links.id")
     link_rows = conn.execute(
         f"""
         SELECT {_LINK_COLUMNS} FROM links
         WHERE {where}
           {never_clause}
+          {source_clause}
           AND EXISTS (SELECT 1 FROM page_links WHERE page_links.link_id = links.id)
         ORDER BY {order_by}
         """,
-        {**params, **never_params},
+        {**params, **never_params, **source_params},
     ).fetchall()
     return _rows_with_pages(conn, link_rows)
 

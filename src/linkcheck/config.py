@@ -57,6 +57,39 @@ def never_check_host_clause(host_column: str = "host") -> tuple[str, dict[str, s
     placeholders = ",".join(f":{name}" for name in params)
     return f"AND {host_column} NOT IN ({placeholders})", params
 
+# Anchor text used site-wide to mark a citation/attribution link ("here's where we got
+# this lesson material from") rather than a link students are meant to click - both
+# sites pair these with an explicit "NOTE: Do NOT click on 'source' links" disclaimer in
+# the page content. A link is only excluded from reporting if *every* page_links row
+# referencing it uses one of these literal (trimmed, lowercased) texts - see
+# source_citation_link_clause. These links are still crawled and checked normally, just
+# left out of the broken/unreachable report so they don't compete for attention with
+# links that actually need fixing.
+SOURCE_CITATION_LINK_TEXTS = frozenset({"source", "source)", "(source)"})
+
+
+def source_citation_link_clause(link_id_column: str = "links.id") -> tuple[str, dict[str, str]]:
+    """SQL fragment (starting with "AND") plus its named params, excluding links whose
+    every page_links reference uses SOURCE_CITATION_LINK_TEXTS - splice into a query's
+    WHERE clause the same way as never_check_host_clause.
+
+    Keeps the link only if at least one page_links row referencing it uses text
+    outside the citation set (i.e. it has at least one legitimate, non-citation use) -
+    a link cited as "source" on one page but a real course link on another must still
+    show up as a problem.
+    """
+    params = {f"source_citation_{i}": text for i, text in enumerate(SOURCE_CITATION_LINK_TEXTS)}
+    placeholders = ",".join(f":{name}" for name in params)
+    return (
+        f"""AND EXISTS (
+            SELECT 1 FROM page_links source_check_pl
+            WHERE source_check_pl.link_id = {link_id_column}
+              AND (source_check_pl.link_text IS NULL
+                   OR TRIM(LOWER(source_check_pl.link_text)) NOT IN ({placeholders}))
+        )""",
+        params,
+    )
+
 # Per-domain concurrency and rate limiting are enforced in SQL against domain_state/
 # domain_claims (see schema.sql, checker.claim_checkable_links) - not in-process
 # semaphores. CHECK_GLOBAL_CONCURRENCY is just a soft cap on how many checks this

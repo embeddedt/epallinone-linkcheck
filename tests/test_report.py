@@ -151,6 +151,36 @@ def test_get_problem_links_excludes_orphaned_links(conn):
     assert report.get_problem_links(conn) == []
 
 
+@pytest.mark.parametrize("text", ["source", "Source", "(source)", "source)", "  source  "])
+def test_get_problem_links_excludes_source_citation_links(conn, text):
+    # Both sites mark citation/attribution links with literal anchor text "source"
+    # (styled and disclaimed as "do not click" in the page content itself) - these
+    # should never show up as something to fix. See config.source_citation_link_clause.
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/citation", text=text, day_context=None)],
+    )
+    _confirm_broken(conn)
+
+    assert report.get_problem_links(conn) == []
+    summaries = {s.slug: s for s in report.get_site_summaries(conn)}
+    assert summaries["homeschool"].broken == 0
+    assert summaries["homeschool"].total == 0
+
+
+def test_get_problem_links_keeps_source_text_link_if_used_as_a_real_link_elsewhere(conn):
+    # The same URL might be a throwaway citation on one page but a genuine course link
+    # on another - only suppress it if *every* reference to it uses the citation text.
+    shared = ExtractedLink(url="https://ext.example.com/shared", text="source", day_context=None)
+    real = ExtractedLink(url="https://ext.example.com/shared", text="Read this", day_context=None)
+    _sync(conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/", [shared])
+    _sync(conn, "homeschool", "math-2", "https://allinonehomeschool.com/math-2/", [real])
+    _confirm_broken(conn)
+
+    problem_links = report.get_problem_links(conn)
+    assert len(problem_links) == 1
+
+
 def test_get_watch_links_excludes_confirmed_and_healthy_links(conn):
     _sync(
         conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
