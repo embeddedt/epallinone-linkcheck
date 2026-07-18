@@ -7,6 +7,7 @@ import html
 import logging
 import re
 import sqlite3
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from urllib.parse import urljoin, urlparse
@@ -22,6 +23,21 @@ logger = logging.getLogger(__name__)
 CONTENT_SELECTOR = ".entry-content"
 DAY_ID_RE = re.compile(r"^day\d+$", re.IGNORECASE)
 _MISSING_SLASH_RE = re.compile(r"^(https?):/(?!/)", re.IGNORECASE)
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _visible_text(tag: Tag) -> str:
+    """Flatten a tag's text the way a browser renders it: concatenate every text node
+    as-is, then collapse whitespace runs to a single space.
+
+    `Tag.get_text(strip=True)` strips each individual text node before joining them -
+    fine for a human-readable label, but it silently drops/adds whitespace at tag
+    boundaries (e.g. "Act V</a>." loses no space, but "the <a>audio</a> here" gains
+    one it never had if a separator is passed). Either way the result stops being a
+    literal substring of the page's real text, which breaks exact-match consumers
+    like the Scroll-To-Text-Fragment context below.
+    """
+    return _WHITESPACE_RE.sub(" ", tag.get_text()).strip()
 
 
 def _fix_missing_slash(url: str) -> str:
@@ -135,6 +151,58 @@ class ExtractedLink:
     url: str
     text: str
     day_context: str | None
+    context_before: str | None = None
+    context_after: str | None = None
+
+
+CONTEXT_CHARS = 60  # how much surrounding prose to keep on each side, best-effort
+_CONTEXT_BLOCK_TAGS = ["p", "li", "div", "td", "th", "dd", "dt", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"]
+
+
+def _truncate_at_word_boundary(text: str, max_chars: int, *, keep_end: bool) -> str:
+    """Truncate to at most max_chars without ever cutting a word in half - a
+    mid-word cut (e.g. "Read" -> "Re") is still a literal substring of the page's
+    text, but it's no longer a *word*, and a Scroll-To-Text-Fragment match that ends
+    mid-word is exactly the kind of edge case that trips up browser matchers. Any
+    partial word left at the trimmed edge is dropped rather than kept.
+    """
+    if len(text) <= max_chars:
+        return text
+    if keep_end:
+        cut = text[-max_chars:]
+        space = cut.find(" ")
+        return cut[space + 1 :] if space != -1 else cut
+    cut = text[:max_chars]
+    space = cut.rfind(" ")
+    return cut[:space] if space != -1 else cut
+
+
+def _link_context(node: Tag) -> tuple[str | None, str | None]:
+    """Best-effort prose immediately before/after a link's anchor text, from its
+    nearest block-level ancestor (paragraph, list item, table cell, ...).
+
+    Stored so a human can locate a broken link on the live page by eye or Ctrl-F even
+    when day_context is unavailable (or, like link_text alone, ambiguous - "source"
+    repeated across a page). Also lets scroll-to-text-fragment be reintroduced later
+    with prefix-/suffix- context to disambiguate a repeated anchor phrase, rather than
+    matching whichever occurrence happens to come first in the document.
+    """
+    block = node.find_parent(_CONTEXT_BLOCK_TAGS)
+    if block is None:
+        return None, None
+    block_text = _visible_text(block)
+    link_text = _visible_text(node)
+    if not link_text:
+        return None, None
+    idx = block_text.find(link_text)
+    if idx == -1:
+        return None, None
+    before = block_text[:idx].strip()
+    after = block_text[idx + len(link_text) :].strip()
+    return (
+        _truncate_at_word_boundary(before, CONTEXT_CHARS, keep_end=True) or None,
+        _truncate_at_word_boundary(after, CONTEXT_CHARS, keep_end=False) or None,
+    )
 
 
 def extract_links(html: str, page_url: str, site_base_url: str) -> list[ExtractedLink]:
@@ -153,9 +221,18 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     `<div id="dayN">` on one site, `<strong id="dayN">` on the other) is
     captured best-effort purely so reports can say "Math 1, Day 47" instead
     of just "Math 1" - extraction does not depend on it.
+
+    Some course pages reuse the same day id once per week instead of numbering days
+    uniquely across the whole page (e.g. "day1" marks the first lesson of every week,
+    not just the first lesson overall). `id` values are supposed to be unique, so a
+    `#dayN` link only takes a browser to the *first* matching element - on a page like
+    that, it would silently jump to the wrong week. day_context is dropped (left None)
+    for any day id that isn't unique on the page, rather than emit an anchor that
+    points somewhere else on the page than the link it's meant to locate.
     """
     soup = BeautifulSoup(html, "lxml")
     base_host = urlparse(site_base_url).netloc.lower()
+    day_id_counts = Counter(node.get("id") for node in soup.find_all(id=DAY_ID_RE))
 
     current_day: str | None = None
     seen: dict[str, ExtractedLink] = {}
@@ -173,9 +250,17 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         absolute = _fix_missing_slash(urljoin(page_url, href)).split("#", 1)[0]
         if not absolute or urlparse(absolute).netloc.lower() == base_host:
             continue
+        day_context = current_day if current_day and day_id_counts[current_day] == 1 else None
+        context_before, context_after = _link_context(node)
         seen.setdefault(
             absolute,
-            ExtractedLink(url=absolute, text=node.get_text(strip=True), day_context=current_day),
+            ExtractedLink(
+                url=absolute,
+                text=_visible_text(node),
+                day_context=day_context,
+                context_before=context_before,
+                context_after=context_after,
+            ),
         )
     return list(seen.values())
 
@@ -259,11 +344,15 @@ def sync_course_page(
             current_link_ids.append(link_id)
             conn.execute(
                 """
-                INSERT INTO page_links (page_id, link_id, day_context, link_text, last_seen_at)
-                VALUES (:page_id, :link_id, :day_context, :link_text, :now)
+                INSERT INTO page_links
+                    (page_id, link_id, day_context, link_text, context_before, context_after, last_seen_at)
+                VALUES
+                    (:page_id, :link_id, :day_context, :link_text, :context_before, :context_after, :now)
                 ON CONFLICT(page_id, link_id) DO UPDATE SET
                     day_context = excluded.day_context,
                     link_text = excluded.link_text,
+                    context_before = excluded.context_before,
+                    context_after = excluded.context_after,
                     last_seen_at = excluded.last_seen_at
                 """,
                 {
@@ -271,6 +360,8 @@ def sync_course_page(
                     "link_id": link_id,
                     "day_context": link.day_context,
                     "link_text": link.text,
+                    "context_before": link.context_before,
+                    "context_after": link.context_after,
                     "now": now,
                 },
             )

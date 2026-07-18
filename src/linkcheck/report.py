@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from urllib.parse import quote
 
 from jinja2 import Environment, PackageLoader, select_autoescape
 
@@ -47,6 +48,8 @@ class PageRef:
     page_url: str
     day_context: str | None
     link_text: str | None
+    context_before: str | None
+    context_after: str | None
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,51 @@ class LinkReportRow:
     first_seen_at: str
     next_check_at: str
     pages: list[PageRef]
+
+
+@dataclass(frozen=True)
+class PageGroupEntry:
+    link: LinkReportRow
+    day_context: str | None
+    link_text: str | None
+    context_before: str | None
+    context_after: str | None
+
+
+@dataclass(frozen=True)
+class PageGroup:
+    site_slug: str
+    page_title: str
+    page_url: str
+    entries: list[PageGroupEntry]
+
+
+def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
+    """Flatten each link's page references into (page, link) pairs and group by page,
+    so the dashboard can render one table per course page instead of cramming every
+    page a link appears on into a single "Found on" column. A link referenced from
+    multiple pages lands in each page's group - same reasoning as get_site_summaries:
+    it's a real risk from every page it's linked from.
+    """
+    groups: dict[tuple[str, str, str], list[PageGroupEntry]] = {}
+    for link in links:
+        for page in link.pages:
+            key = (page.site_slug, page.page_title, page.page_url)
+            groups.setdefault(key, []).append(
+                PageGroupEntry(
+                    link=link,
+                    day_context=page.day_context,
+                    link_text=page.link_text,
+                    context_before=page.context_before,
+                    context_after=page.context_after,
+                )
+            )
+    return [
+        PageGroup(site_slug=slug, page_title=title, page_url=url, entries=entries)
+        for (slug, title, url), entries in sorted(
+            groups.items(), key=lambda item: (-len(item[1]), item[0])
+        )
+    ]
 
 
 @dataclass(frozen=True)
@@ -143,6 +191,8 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
         f"""
         SELECT page_links.link_id AS link_id, page_links.day_context AS day_context,
                page_links.link_text AS link_text,
+               page_links.context_before AS context_before,
+               page_links.context_after AS context_after,
                pages.title AS page_title, pages.url AS page_url, sites.slug AS site_slug
         FROM page_links
         JOIN pages ON pages.id = page_links.page_id
@@ -162,6 +212,8 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
                 page_url=row["page_url"],
                 day_context=row["day_context"],
                 link_text=row["link_text"],
+                context_before=row["context_before"],
+                context_after=row["context_after"],
             )
         )
 
@@ -279,6 +331,53 @@ def _outcome(link: LinkReportRow) -> str:
     return checker.outcome(link.last_http_status, link.last_error_type)
 
 
+def _text_fragment(text: str) -> str:
+    """Percent-encode text for a Scroll-To-Text-Fragment directive (`#:~:text=...`).
+    Hyphens are significant in the directive's own mini-syntax (they separate the
+    optional prefix-/suffix- and start,end segments) so, unlike normal URL encoding, a
+    literal hyphen must still be escaped even though urllib.parse.quote treats it as
+    always-safe.
+    """
+    return quote(text, safe="").replace("-", "%2D")
+
+
+MIN_TEXT_FRAGMENT_WORDS = 5  # below this, the directive is too short to trust - see found_on_href
+
+
+def found_on_href(group: PageGroup, entry: PageGroupEntry) -> str:
+    """Build the "Found on" link target for one broken-link row.
+
+    Layers two independent navigation aids into one URL fragment:
+    - the day-id anchor (`#dayN`), when the page has one - safe to use bare because
+      extract_links only ever records a day_context that's unique on the page (see
+      its docstring); a non-unique id would take a browser to the wrong occurrence.
+    - a Scroll-To-Text-Fragment directive (`:~:text=...`), when link_text plus its
+      prefix-/suffix- context (the prose immediately before/after, captured at crawl
+      time) together reach MIN_TEXT_FRAGMENT_WORDS. A bare link_text alone was tried
+      before and reverted - a common phrase like "source" repeated across the page
+      matched the wrong one. Anchoring to exact adjacent prose fixes that when there's
+      enough of it, but a link like "Soviet" sitting in its own bare list item has no
+      surrounding prose to anchor to at all - a single common word is exactly the kind
+      of directive a browser's matcher can land on the wrong occurrence of, or refuse
+      to match, so below the word threshold it's skipped rather than emitted anyway.
+
+    Falls back to the bare page URL (no fragment) when nothing usable is available -
+    browsers without Scroll-To-Text-Fragment support just ignore the unrecognized
+    fragment regardless.
+    """
+    fragment = entry.day_context or ""
+    word_count = sum(len((text or "").split()) for text in (entry.context_before, entry.link_text, entry.context_after))
+    if entry.link_text and word_count >= MIN_TEXT_FRAGMENT_WORDS:
+        text_directive = ""
+        if entry.context_before:
+            text_directive += f"{_text_fragment(entry.context_before)}-,"
+        text_directive += _text_fragment(entry.link_text)
+        if entry.context_after:
+            text_directive += f",-{_text_fragment(entry.context_after)}"
+        fragment += f":~:text={text_directive}"
+    return f"{group.page_url}#{fragment}" if fragment else group.page_url
+
+
 def render_text_report(
     summaries: list[SiteSummary],
     problem_links: list[LinkReportRow],
@@ -330,6 +429,7 @@ _env = Environment(
     autoescape=select_autoescape(["html"]),
 )
 _env.filters["outcome"] = _outcome
+_env.globals["found_on_href"] = found_on_href
 
 
 def render_html_report(
@@ -342,6 +442,8 @@ def render_html_report(
     return template.render(
         summaries=summaries,
         problem_links=problem_links,
+        problem_groups=_group_by_page(problem_links),
         watch_links=watch_links,
+        watch_groups=_group_by_page(watch_links),
         generated_at=generated_at,
     )

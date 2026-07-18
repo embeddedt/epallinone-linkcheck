@@ -300,3 +300,91 @@ def test_render_html_report_empty_state(conn):
     html = report.render_html_report([], [], [], "2026-01-01T00:00:00")
     assert "No broken or unreachable links." in html
     assert "Watching (" not in html  # section itself is skipped; summary column header still says "Watching"
+
+
+def _entry(day_context=None, link_text=None, context_before=None, context_after=None):
+    return report.PageGroupEntry(
+        link=None,
+        day_context=day_context,
+        link_text=link_text,
+        context_before=context_before,
+        context_after=context_after,
+    )
+
+
+_GROUP = report.PageGroup(
+    site_slug="highschool", page_title="Chemistry", page_url="https://allinonehighschool.com/chemistry/", entries=[]
+)
+
+
+def test_found_on_href_bare_page_when_nothing_known():
+    assert report.found_on_href(_GROUP, _entry()) == _GROUP.page_url
+
+
+def test_found_on_href_day_context_only():
+    href = report.found_on_href(_GROUP, _entry(day_context="day3"))
+    assert href == f"{_GROUP.page_url}#day3"
+
+
+def test_found_on_href_text_fragment_only():
+    href = report.found_on_href(_GROUP, _entry(link_text="a fairly long chunk of anchor text"))
+    assert href == f"{_GROUP.page_url}#:~:text=a%20fairly%20long%20chunk%20of%20anchor%20text"
+
+
+def test_found_on_href_combines_day_context_and_text_fragment():
+    href = report.found_on_href(_GROUP, _entry(day_context="day3", link_text="a fairly long anchor phrase"))
+    assert href == f"{_GROUP.page_url}#day3:~:text=a%20fairly%20long%20anchor%20phrase"
+
+
+def test_found_on_href_skips_text_fragment_below_word_threshold():
+    # a single short word with no surrounding prose (e.g. a bare "Soviet" list item) is
+    # too short/generic a directive to trust - day_context alone is used instead
+    href = report.found_on_href(_GROUP, _entry(day_context="day92", link_text="Soviet"))
+    assert href == f"{_GROUP.page_url}#day92"
+
+
+def test_found_on_href_skips_text_fragment_below_word_threshold_falls_back_to_bare_page():
+    # same, but with no day_context either - falls all the way back to the bare page
+    href = report.found_on_href(_GROUP, _entry(link_text="Soviet"))
+    assert href == _GROUP.page_url
+
+
+def test_found_on_href_counts_context_words_toward_the_threshold():
+    # link_text alone is short, but enough surrounding prose pushes the total over
+    # the threshold, so the fragment is still used
+    href = report.found_on_href(
+        _GROUP,
+        _entry(link_text="source", context_before="check out this great", context_after="for more information"),
+    )
+    assert ":~:text=" in href
+
+
+def test_found_on_href_uses_text_fragment_right_at_word_threshold():
+    href = report.found_on_href(_GROUP, _entry(link_text="one two three four five"))
+    assert ":~:text=" in href
+
+
+def test_found_on_href_skips_text_fragment_just_below_word_threshold():
+    href = report.found_on_href(_GROUP, _entry(link_text="one two three four"))
+    assert ":~:text=" not in href
+
+
+def test_found_on_href_adds_prefix_and_suffix_context():
+    href = report.found_on_href(
+        _GROUP,
+        _entry(link_text="source", context_before="see the", context_after="for more detail"),
+    )
+    assert href == f"{_GROUP.page_url}#:~:text=see%20the-,source,-for%20more%20detail"
+
+
+def test_found_on_href_escapes_hyphens_and_commas_in_context():
+    # hyphens and commas are meaningful in the text directive's own mini-syntax and
+    # must be escaped even inside the encoded text itself, not just as separators
+    href = report.found_on_href(
+        _GROUP,
+        _entry(link_text="non-fiction, sort of", context_before="a-b", context_after="c,d"),
+    )
+    assert "non%2Dfiction%2C%20sort%20of" in href
+    assert "a%2Db-," in href
+    assert ",-c%2Cd" in href
+    assert href.count("%2D") == 2  # both literal hyphens escaped, not just the separators

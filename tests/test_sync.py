@@ -167,6 +167,47 @@ def test_sync_reappearing_link_is_re_associated_and_keeps_scheduling_state(conn)
     assert row["last_checked_at"] == "2026-01-01T00:00:00"
 
 
+def test_sync_stores_and_updates_surrounding_context(conn):
+    sync_course_page(
+        conn,
+        "homeschool",
+        make_page(),
+        [ExtractedLink(
+            url="https://ext.example.com/a", text="source", day_context="day1",
+            context_before="see the", context_after="for more detail",
+        )],
+    )
+    row = conn.execute(
+        """
+        SELECT context_before, context_after FROM page_links
+        JOIN links ON links.id = page_links.link_id
+        WHERE links.url = 'https://ext.example.com/a'
+        """
+    ).fetchone()
+    assert row["context_before"] == "see the"
+    assert row["context_after"] == "for more detail"
+
+    # recrawl with different surrounding text updates it in place
+    sync_course_page(
+        conn,
+        "homeschool",
+        make_page(),
+        [ExtractedLink(
+            url="https://ext.example.com/a", text="source", day_context="day1",
+            context_before="check this", context_after="before continuing",
+        )],
+    )
+    row = conn.execute(
+        """
+        SELECT context_before, context_after FROM page_links
+        JOIN links ON links.id = page_links.link_id
+        WHERE links.url = 'https://ext.example.com/a'
+        """
+    ).fetchone()
+    assert row["context_before"] == "check this"
+    assert row["context_after"] == "before continuing"
+
+
 def test_sync_unknown_site_raises(conn):
     with pytest.raises(ValueError, match="Unknown site slug"):
         sync_course_page(conn, "nonexistent", make_page(), [])

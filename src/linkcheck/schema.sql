@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS page_links (
     link_id INTEGER NOT NULL REFERENCES links(id),
     day_context TEXT,                      -- best-effort nearest id="dayN"; nullable
     link_text TEXT,                        -- anchor text, for readable reports
+    context_before TEXT,                   -- best-effort prose immediately before the link
+    context_after TEXT,                    -- best-effort prose immediately after the link
     last_seen_at TEXT NOT NULL,
     PRIMARY KEY (page_id, link_id)
 );

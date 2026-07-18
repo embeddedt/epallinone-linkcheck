@@ -28,8 +28,21 @@ def init_db(conn: sqlite3.Connection) -> None:
     """Create tables if missing and sync the `sites` config into the DB."""
     schema = resources.files("linkcheck").joinpath("schema.sql").read_text()
     conn.executescript(schema)
+    _add_column_if_missing(conn, "page_links", "context_before", "TEXT")
+    _add_column_if_missing(conn, "page_links", "context_after", "TEXT")
     _sync_sites(conn)
     conn.commit()
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, ddl_type: str) -> None:
+    """`CREATE TABLE IF NOT EXISTS` only helps on a fresh DB - an existing table needs
+    an explicit ALTER TABLE to pick up a column added to schema.sql later. Guarded by
+    PRAGMA table_info rather than just trying the ALTER and swallowing the "duplicate
+    column" error, since that error string isn't a stable/documented sqlite3 contract.
+    """
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
 
 
 def _sync_sites(conn: sqlite3.Connection) -> None:
