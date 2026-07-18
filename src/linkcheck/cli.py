@@ -124,7 +124,8 @@ def crawl_command(db_path: str, limit: int | None) -> None:
                     if not result.found:
                         click.echo(f"  SKIP (not found): {result.course.title!r} -> {result.course.url}")
                         continue
-                    click.echo(f"  {result.course.title!r}: {result.link_count} external links synced")
+                    suffix = " (unchanged)" if result.unchanged else ""
+                    click.echo(f"  {result.course.title!r}: {result.link_count} external links synced{suffix}")
 
     try:
         asyncio.run(run())

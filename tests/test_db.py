@@ -55,3 +55,33 @@ def test_init_db_migrates_existing_page_links_table_missing_context_columns():
     row = conn.execute("SELECT * FROM page_links").fetchone()
     assert row["link_text"] == "source"  # pre-existing data survives the migration
     assert row["context_before"] is None
+
+
+def test_init_db_migrates_existing_pages_table_missing_modified_gmt():
+    # simulates a DB created before modified_gmt existed in schema.sql
+    conn = db.connect(":memory:")
+    conn.executescript("""
+        CREATE TABLE pages (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT,
+            last_crawled_at TEXT,
+            UNIQUE(site_id, url)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO pages (site_id, url, slug, title, last_crawled_at) "
+        "VALUES (1, 'https://example.com/x/', 'x', 'X', '2026-01-01T00:00:00')"
+    )
+    conn.commit()
+
+    db.init_db(conn)
+
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(pages)")}
+    assert "modified_gmt" in columns
+
+    row = conn.execute("SELECT * FROM pages").fetchone()
+    assert row["title"] == "X"  # pre-existing data survives the migration
+    assert row["modified_gmt"] is None

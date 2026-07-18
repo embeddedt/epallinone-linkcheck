@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS pages (
     slug TEXT NOT NULL,
     title TEXT,
     last_crawled_at TEXT,
+    modified_gmt TEXT,                     -- WP REST API's `modified_gmt` as of last crawl;
+                                            -- lets a recrawl skip re-parsing an unchanged page
     UNIQUE(site_id, url)
 );
 

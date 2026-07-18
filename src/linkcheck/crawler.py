@@ -104,26 +104,35 @@ class CoursePage:
     canonical_url: str
     title: str
     html: str
+    modified_gmt: str | None = None
 
 
 def _slug_from_url(url: str) -> str:
     return url.rstrip("/").rsplit("/", 1)[-1]
 
 
-async def fetch_course_page(
-    client: httpx.AsyncClient, site: Site, course: CourseLink
-) -> CoursePage | None:
-    """Fetch a course page's rendered body via the WP REST API, by slug.
+# Sparse fieldset (WP core's `_fields` param) for the cheap "has this page changed"
+# check - a few hundred bytes instead of the full rendered body.
+PAGE_MODIFIED_FIELDS = "id,modified_gmt"
 
-    The REST API resolves by slug regardless of the page's URL path shape -
-    verified against both flat slugs (`/ep-math-1/`) and pages nested under
-    the index page itself (`/individual-courses-of-study/intermediate-language-arts/`).
-    Returns None if the slug no longer resolves to a page (course removed/renamed).
+
+async def _fetch_wp_page(
+    client: httpx.AsyncClient, site: Site, slug: str, *, fields: str | None = None
+) -> dict | None:
+    """Look up a page by slug via the WP REST API. Returns the raw JSON object, or
+    None if the slug doesn't resolve to a page (course removed/renamed) or the API
+    returned something unexpected.
+
+    The REST API resolves by slug regardless of the page's URL path shape - verified
+    against both flat slugs (`/ep-math-1/`) and pages nested under the index page
+    itself (`/individual-courses-of-study/intermediate-language-arts/`).
     """
-    slug = _slug_from_url(course.url)
+    params = {"slug": slug}
+    if fields is not None:
+        params["_fields"] = fields
     response = await client.get(
         f"{site.base_url}/wp-json/wp/v2/pages",
-        params={"slug": slug},
+        params=params,
         headers={"User-Agent": USER_AGENT},
     )
     response.raise_for_status()
@@ -136,13 +145,41 @@ async def fetch_course_page(
         if results:
             logger.warning("Unexpected WP response for slug %r: %r", slug, results)
         return None
-    data = results[0]
+    return results[0]
+
+
+async def fetch_page_modified(client: httpx.AsyncClient, site: Site, slug: str) -> str | None:
+    """Cheap check of a page's current `modified_gmt` via a sparse WP REST fieldset,
+    to decide whether a recrawl needs to fetch the full body at all. Verified live
+    against WordPress.com-hosted sites: no ETag/Last-Modified header is ever sent on
+    this endpoint and conditional GET (If-Modified-Since/If-None-Match) is ignored
+    outright, so this is done via WP's own `modified_gmt` field instead of HTTP
+    caching semantics. Returns None if the slug no longer resolves to a page - the
+    caller falls back to a full fetch either way, which resolves found-vs-not-found
+    on its own.
+    """
+    data = await _fetch_wp_page(client, site, slug, fields=PAGE_MODIFIED_FIELDS)
+    return data["modified_gmt"] if data else None
+
+
+async def fetch_course_page(
+    client: httpx.AsyncClient, site: Site, course: CourseLink
+) -> CoursePage | None:
+    """Fetch a course page's rendered body via the WP REST API, by slug.
+
+    Returns None if the slug no longer resolves to a page (course removed/renamed).
+    """
+    slug = _slug_from_url(course.url)
+    data = await _fetch_wp_page(client, site, slug)
+    if data is None:
+        return None
     return CoursePage(
         wp_id=data["id"],
         slug=data["slug"],
         canonical_url=data["link"],
         title=html.unescape(data["title"]["rendered"]),
         html=data["content"]["rendered"],
+        modified_gmt=data["modified_gmt"],
     )
 
 
@@ -280,12 +317,13 @@ def _upsert_page(conn: sqlite3.Connection, site_id: int, page: CoursePage) -> in
     now = _now()
     row = conn.execute(
         """
-        INSERT INTO pages (site_id, url, slug, title, last_crawled_at)
-        VALUES (:site_id, :url, :slug, :title, :now)
+        INSERT INTO pages (site_id, url, slug, title, last_crawled_at, modified_gmt)
+        VALUES (:site_id, :url, :slug, :title, :now, :modified_gmt)
         ON CONFLICT(site_id, url) DO UPDATE SET
             slug = excluded.slug,
             title = excluded.title,
-            last_crawled_at = excluded.last_crawled_at
+            last_crawled_at = excluded.last_crawled_at,
+            modified_gmt = excluded.modified_gmt
         RETURNING id
         """,
         {
@@ -294,9 +332,34 @@ def _upsert_page(conn: sqlite3.Connection, site_id: int, page: CoursePage) -> in
             "slug": page.slug,
             "title": page.title,
             "now": now,
+            "modified_gmt": page.modified_gmt,
         },
     ).fetchone()
     return row["id"]
+
+
+def _known_page_state(conn: sqlite3.Connection, site_id: int, slug: str) -> sqlite3.Row | None:
+    """Look up a previously crawled page's id and modified_gmt by (site, slug) - the
+    stable join key across a recrawl, since a page's URL path can differ from the
+    course-index link that discovered it (see fetch_course_page's docstring).
+    """
+    return conn.execute(
+        "SELECT id, modified_gmt FROM pages WHERE site_id = ? AND slug = ?",
+        (site_id, slug),
+    ).fetchone()
+
+
+def _touch_page_crawled(conn: sqlite3.Connection, page_id: int) -> int:
+    """Record that a page was recrawled and found unchanged, without re-parsing or
+    diffing its links. Returns its current link count for the crawl summary.
+    """
+    now = _now()
+    with conn:
+        conn.execute("UPDATE pages SET last_crawled_at = ? WHERE id = ?", (now, page_id))
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM page_links WHERE page_id = ?", (page_id,)
+        ).fetchone()
+    return row["n"]
 
 
 def _upsert_link(conn: sqlite3.Connection, url: str) -> int:
@@ -381,6 +444,7 @@ class CrawlResult:
     course: CourseLink
     found: bool
     link_count: int
+    unchanged: bool = False  # modified_gmt matched the stored value - full body/parse skipped
 
 
 async def crawl_site(
@@ -404,10 +468,24 @@ async def crawl_site(
     if limit is not None:
         courses = courses[:limit]
 
+    site_id = _get_site_id(conn, site.slug)
     semaphore = asyncio.Semaphore(concurrency)
 
     async def _crawl_one(course: CourseLink) -> CrawlResult:
+        slug = _slug_from_url(course.url)
+        known = _known_page_state(conn, site_id, slug)
+
         async with semaphore:
+            # A page seen before gets a cheap modified_gmt check first - most course
+            # pages don't change day to day, so this skips the full body fetch and
+            # link re-extraction for the common case (see fetch_page_modified).
+            if known is not None and known["modified_gmt"] is not None:
+                current_modified = await fetch_page_modified(client, site, slug)
+                await asyncio.sleep(request_delay)
+                if current_modified is not None and current_modified == known["modified_gmt"]:
+                    link_count = _touch_page_crawled(conn, known["id"])
+                    return CrawlResult(course=course, found=True, link_count=link_count, unchanged=True)
+
             page = await fetch_course_page(client, site, course)
             await asyncio.sleep(request_delay)
         if page is None:
