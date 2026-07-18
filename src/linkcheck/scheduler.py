@@ -24,7 +24,7 @@ from linkcheck.config import (
     CHECK_PROGRESS_LOG_SECONDS,
     CHECK_STALE_CLAIM_SECONDS,
     CHECK_TIMEOUT_SECONDS,
-    CRAWL_INTERVAL_HOURS,
+    CRAWL_INTERVAL_MINUTES,
     CRAWL_TIMEOUT_SECONDS,
     DASHBOARD_HTML_PATH,
     SITES,
@@ -81,7 +81,7 @@ async def crawl_loop(
                 _write_dashboard(conn, dashboard_path)
             except Exception:
                 logger.exception("Failed to regenerate dashboard after crawl")
-            await _sleep_or_stop(stop_event, CRAWL_INTERVAL_HOURS * 3600)
+            await _sleep_or_stop(stop_event, CRAWL_INTERVAL_MINUTES * 60)
 
 
 def _write_dashboard(conn: sqlite3.Connection, dashboard_path: str) -> None:

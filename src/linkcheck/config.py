@@ -32,7 +32,7 @@ USER_AGENT = (
 )
 
 # --- crawl phase ---
-CRAWL_INTERVAL_HOURS = 1
+CRAWL_INTERVAL_MINUTES = 15
 CRAWL_CONCURRENCY = 5
 CRAWL_REQUEST_DELAY_SECONDS = 0.2
 CRAWL_TIMEOUT_SECONDS = 20  # per-request timeout for course-index and page fetches
