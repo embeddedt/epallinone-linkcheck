@@ -10,7 +10,6 @@ wheels/
 .venv
 
 # Runtime data
-*.db
-*.db-journal
+*.db*
 .pytest_cache/
 public/status.html
