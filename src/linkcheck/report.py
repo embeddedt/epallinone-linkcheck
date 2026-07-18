@@ -381,6 +381,12 @@ def _outcome(link: LinkReportRow) -> str:
     return checker.outcome(link.last_http_status, link.last_error_type)
 
 
+def _link_text_display(page) -> str:
+    if page.link_text:
+        return f' — "{page.link_text}"'
+    return " — <no visible link text — check page source>"
+
+
 def _text_fragment(text: str) -> str:
     """Percent-encode text for a Scroll-To-Text-Fragment directive (`#:~:text=...`).
     Hyphens are significant in the directive's own mini-syntax (they separate the
@@ -452,8 +458,7 @@ def render_text_report(
             )
             for page in link.pages:
                 day = f", {page.day_label or page.day_context}" if page.day_context else ""
-                text = f' — "{page.link_text}"' if page.link_text else ""
-                lines.append(f"      on {page.site_slug}: {page.page_title!r}{day}{text}")
+                lines.append(f"      on {page.site_slug}: {page.page_title!r}{day}{_link_text_display(page)}")
 
     if watch_links:
         lines.append("")
@@ -468,8 +473,7 @@ def render_text_report(
             )
             for page in link.pages:
                 day = f", {page.day_label or page.day_context}" if page.day_context else ""
-                text = f' — "{page.link_text}"' if page.link_text else ""
-                lines.append(f"      on {page.site_slug}: {page.page_title!r}{day}{text}")
+                lines.append(f"      on {page.site_slug}: {page.page_title!r}{day}{_link_text_display(page)}")
 
     return "\n".join(lines)
 

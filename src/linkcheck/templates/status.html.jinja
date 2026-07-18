@@ -111,7 +111,7 @@
       <td>{{ entry.link.status }}</td>
       <td>{{ entry.link|outcome }}</td>
       <td>
-        {% if entry.link_text %}&ldquo;{% if entry.context_before %}&hellip;{{ entry.context_before }} {% endif %}<strong>{{ entry.link_text }}</strong>{% if entry.context_after %} {{ entry.context_after }}&hellip;{% endif %}&rdquo;{% endif %}
+        {% if entry.link_text %}&ldquo;{% if entry.context_before %}&hellip;{{ entry.context_before }} {% endif %}<strong>{{ entry.link_text }}</strong>{% if entry.context_after %} {{ entry.context_after }}&hellip;{% endif %}&rdquo;{% else %}<em>no visible link text &mdash; check page source</em>{% endif %}
         (<a href="{{ found_on_href(group, entry) }}" target="_blank" rel="noopener noreferrer">{% if entry.day_context %}{{ entry.day_label or entry.day_context }}{% else %}view on page{% endif %}</a>)
       </td>
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
@@ -166,7 +166,7 @@
       <td class="status-watching">watching</td>
       <td>{{ entry.link|outcome }}</td>
       <td>
-        {% if entry.link_text %}&ldquo;{% if entry.context_before %}&hellip;{{ entry.context_before }} {% endif %}<strong>{{ entry.link_text }}</strong>{% if entry.context_after %} {{ entry.context_after }}&hellip;{% endif %}&rdquo;{% endif %}
+        {% if entry.link_text %}&ldquo;{% if entry.context_before %}&hellip;{{ entry.context_before }} {% endif %}<strong>{{ entry.link_text }}</strong>{% if entry.context_after %} {{ entry.context_after }}&hellip;{% endif %}&rdquo;{% else %}<em>no visible link text &mdash; check page source</em>{% endif %}
         (<a href="{{ found_on_href(group, entry) }}" target="_blank" rel="noopener noreferrer">{% if entry.day_context %}{{ entry.day_label or entry.day_context }}{% else %}view on page{% endif %}</a>)
       </td>
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
