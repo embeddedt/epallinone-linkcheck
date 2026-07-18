@@ -336,6 +336,7 @@ def _entry(day_context=None, day_label=None, link_text=None, context_before=None
     return report.PageGroupEntry(
         link=None,
         day_context=day_context,
+        day_number=int(day_context[3:]) if day_context else None,
         day_label=day_label,
         link_text=link_text,
         context_before=context_before,

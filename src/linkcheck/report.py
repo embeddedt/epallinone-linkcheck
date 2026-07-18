@@ -44,9 +44,12 @@ _LINK_COLUMNS = """
 @dataclass(frozen=True)
 class PageRef:
     site_slug: str
+    site_order: int
     page_title: str
     page_url: str
+    page_order: int
     day_context: str | None
+    day_number: int | None
     day_label: str | None
     link_text: str | None
     context_before: str | None
@@ -71,6 +74,7 @@ class LinkReportRow:
 class PageGroupEntry:
     link: LinkReportRow
     day_context: str | None
+    day_number: int | None
     day_label: str | None
     link_text: str | None
     context_before: str | None
@@ -85,21 +89,44 @@ class PageGroup:
     entries: list[PageGroupEntry]
 
 
+def _day_sort_key(entry: PageGroupEntry) -> tuple[int, int]:
+    """Numeric day order (day2 before day10), not string order. day_number is parsed
+    out of day_context by SQL (see _rows_with_pages) rather than here - entries with
+    no day_context (nothing to order by) sort last.
+    """
+    if entry.day_number is not None:
+        return (0, entry.day_number)
+    return (1, 0)
+
+
 def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
     """Flatten each link's page references into (page, link) pairs and group by page,
     so the dashboard can render one table per course page instead of cramming every
     page a link appears on into a single "Found on" column. A link referenced from
     multiple pages lands in each page's group - same reasoning as get_site_summaries:
     it's a real risk from every page it's linked from.
+
+    Groups are ordered by site then by course/page discovery order (sites.id, pages.id
+    - insertion order, which follows config.SITES and the course index listing) rather
+    than alphabetically, so e.g. all homeschool courses come before all highschool ones
+    and courses appear in their natural listing order rather than sorted by title.
+
+    Entries within a group come from many different links' query results and land in
+    the shared per-page bucket in whichever order those links were iterated in (by
+    status/failure count, not by day) - so they need an explicit final sort by day
+    number here; no single query's ORDER BY can produce it.
     """
     groups: dict[tuple[str, str, str], list[PageGroupEntry]] = {}
+    order_keys: dict[tuple[str, str, str], tuple[int, int]] = {}
     for link in links:
         for page in link.pages:
             key = (page.site_slug, page.page_title, page.page_url)
+            order_keys[key] = (page.site_order, page.page_order)
             groups.setdefault(key, []).append(
                 PageGroupEntry(
                     link=link,
                     day_context=page.day_context,
+                    day_number=page.day_number,
                     day_label=page.day_label,
                     link_text=page.link_text,
                     context_before=page.context_before,
@@ -107,9 +134,14 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
                 )
             )
     return [
-        PageGroup(site_slug=slug, page_title=title, page_url=url, entries=entries)
+        PageGroup(
+            site_slug=slug,
+            page_title=title,
+            page_url=url,
+            entries=sorted(entries, key=_day_sort_key),
+        )
         for (slug, title, url), entries in sorted(
-            groups.items(), key=lambda item: (-len(item[1]), item[0])
+            groups.items(), key=lambda item: order_keys[item[0]]
         )
     ]
 
@@ -195,16 +227,18 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
     page_rows = conn.execute(
         f"""
         SELECT page_links.link_id AS link_id, page_links.day_context AS day_context,
+               CAST(SUBSTR(page_links.day_context, 4) AS INTEGER) AS day_number,
                page_links.day_label AS day_label,
                page_links.link_text AS link_text,
                page_links.context_before AS context_before,
                page_links.context_after AS context_after,
-               pages.title AS page_title, pages.url AS page_url, sites.slug AS site_slug
+               pages.title AS page_title, pages.url AS page_url, pages.id AS page_id,
+               sites.slug AS site_slug, sites.id AS site_id
         FROM page_links
         JOIN pages ON pages.id = page_links.page_id
         JOIN sites ON sites.id = pages.site_id
         WHERE page_links.link_id IN ({placeholders})
-        ORDER BY sites.slug, pages.title
+        ORDER BY sites.id, pages.id, day_number IS NOT NULL DESC, day_number
         """,
         link_ids,
     ).fetchall()
@@ -214,9 +248,12 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
         pages_by_link.setdefault(row["link_id"], []).append(
             PageRef(
                 site_slug=row["site_slug"],
+                site_order=row["site_id"],
                 page_title=row["page_title"],
                 page_url=row["page_url"],
+                page_order=row["page_id"],
                 day_context=row["day_context"],
+                day_number=row["day_number"],
                 day_label=row["day_label"],
                 link_text=row["link_text"],
                 context_before=row["context_before"],
