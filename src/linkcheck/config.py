@@ -103,7 +103,7 @@ CHECK_PROGRESS_LOG_SECONDS = 30
 # confirms it.
 UNCONFIRMED_RETRY_MINUTES = (60, 24 * 60)  # 1 hour after the 1st failure, 1 day after the 2nd
 
-HEALTHY_RECHECK_DAYS = 30  # recheck interval once a link is confirmed ok
+HEALTHY_RECHECK_DAYS = 7  # recheck interval once a link is confirmed ok
 BROKEN_RECHECK_DAYS = 7  # recheck interval once a link is confirmed broken/unreachable
 
 # Links confirmed together (e.g. an entire crawl batch) get the same next_check_at, and
