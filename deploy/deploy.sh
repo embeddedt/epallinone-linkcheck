@@ -10,7 +10,7 @@ APP_DIR=/opt/linkcheck
 STATE_DIR=/var/lib/linkcheck
 UV_BIN=/usr/local/bin/uv
 
-git -C "$APP_DIR" pull --ff-only
+sudo -u linkcheck git -C "$APP_DIR" pull --ff-only
 chown -R linkcheck:linkcheck "$APP_DIR"
 sudo -u linkcheck env HOME="$STATE_DIR" "$UV_BIN" sync --directory "$APP_DIR"
 systemctl restart linkcheck.service
