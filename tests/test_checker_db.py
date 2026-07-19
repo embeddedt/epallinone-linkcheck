@@ -26,7 +26,7 @@ def conn():
     connection.close()
 
 
-def seed_link(conn, url="https://ext.example.com/a"):
+def seed_link(conn, url="https://ext.example.com/a", text="a"):
     # Each call gets its own page - reusing one page across calls would make
     # sync_course_page's stale-link cleanup delete the *previous* call's page_links
     # association, since each call only lists one link as "currently on the page".
@@ -35,7 +35,7 @@ def seed_link(conn, url="https://ext.example.com/a"):
         wp_id=n, slug=f"page-{n}", canonical_url=f"https://allinonehomeschool.com/page-{n}/",
         title="Math 1", html="",
     )
-    sync_course_page(conn, "homeschool", page, [ExtractedLink(url=url, text="a", day_context=None)])
+    sync_course_page(conn, "homeschool", page, [ExtractedLink(url=url, text=text, day_context=None)])
     return conn.execute("SELECT id FROM links WHERE url = ?", (url,)).fetchone()["id"]
 
 
@@ -74,9 +74,24 @@ def test_get_due_links_respects_batch_size(conn):
 
 
 def test_never_check_hosts_are_excluded_from_due_and_claim(conn):
-    # web.archive.org is in NEVER_CHECK_HOSTS - it's crawled and stored but must never
-    # surface as due or be claimed, or it would sit in the queue forever
+    # web.archive.org matches the "never_check_host" rule in config.BLACKLIST_RULES -
+    # it's crawled and stored but must never surface as due or be claimed, or it would
+    # sit in the queue forever
     seed_link(conn, url="https://web.archive.org/web/123/http://x")
+    seed_link(conn, url="https://ext.example.com/a")
+
+    due_urls = {d.url for d in get_due_links(conn, datetime.now(UTC), batch_size=10)}
+    assert due_urls == {"https://ext.example.com/a"}
+
+    claimed_urls = {c.url for c in _claim(conn)}
+    assert claimed_urls == {"https://ext.example.com/a"}
+
+
+def test_source_citation_only_links_are_excluded_from_due_and_claim(conn):
+    # A link whose only reference uses citation text ("source") matches the
+    # "source_citation" rule in config.BLACKLIST_RULES - it's crawled and stored but
+    # must never surface as due or be claimed, same as a never-checked host.
+    seed_link(conn, url="https://ext.example.com/cited", text="source")
     seed_link(conn, url="https://ext.example.com/a")
 
     due_urls = {d.url for d in get_due_links(conn, datetime.now(UTC), batch_size=10)}

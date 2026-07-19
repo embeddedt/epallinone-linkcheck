@@ -37,58 +37,107 @@ CRAWL_CONCURRENCY = 5
 CRAWL_REQUEST_DELAY_SECONDS = 0.2
 CRAWL_TIMEOUT_SECONDS = 20  # per-request timeout for course-index and page fetches
 
-# --- check phase ---
-# Hosts we never select for checking - e.g. web.archive.org is chronically
-# slow/timeout-prone, and each attempt burns a full CHECK_TIMEOUT_SECONDS against its
-# CHECK_PER_DOMAIN_CONCURRENCY slots for no benefit. Links to these hosts are still
-# crawled and stored as usual; they're just never due for a check.
-NEVER_CHECK_HOSTS = frozenset({"web.archive.org"})
+# --- check phase / reporting ---
+# Standardized "never check, never show up" rules. Each rule declares its own SQL
+# predicate (a plain host NOT IN for HostBlacklistRule, a correlated EXISTS over
+# page_links.link_text for LinkTextBlacklistRule) but shares the same fields/method
+# shape, so exclusion_clause() below can fold any number/mix of rules into one
+# combined WHERE-clause fragment without needing to know which kind it's holding.
+# Splice the result into any query that has a host column and links.id in scope -
+# every check-phase and report query does.
 
 
-def never_check_host_clause(host_column: str = "host") -> tuple[str, dict[str, str]]:
-    """SQL fragment (starting with "AND") plus its named params, excluding
-    NEVER_CHECK_HOSTS - splice the fragment into a query's WHERE clause via an
-    f-string and merge the params into that query's params dict. Empty string/dict
-    if the set is empty, so it's always safe to splice in unconditionally.
+@dataclass(frozen=True)
+class HostBlacklistRule:
+    key: str  # slug: namespaces this rule's SQL param names, avoiding collisions
+    label: str  # short display name, for the dashboard
+    reason: str  # human sentence, for the dashboard
+    kind: str  # "host" - display-only, no logic depends on it
+    values: frozenset[str]  # hosts to exclude
+
+    def sql_clause(
+        self, *, host_column: str = "host", link_id_column: str = "links.id"
+    ) -> tuple[str, dict[str, str]]:
+        if not self.values:
+            return "", {}
+        params = {f"{self.key}_{i}": v for i, v in enumerate(self.values)}
+        placeholders = ",".join(f":{name}" for name in params)
+        return f"AND {host_column} NOT IN ({placeholders})", params
+
+
+@dataclass(frozen=True)
+class LinkTextBlacklistRule:
+    key: str
+    label: str
+    reason: str
+    kind: str  # "link text" - display-only
+    values: frozenset[str]  # trimmed/lowercased link_text values to exclude
+
+    def sql_clause(
+        self, *, host_column: str = "host", link_id_column: str = "links.id"
+    ) -> tuple[str, dict[str, str]]:
+        if not self.values:
+            return "", {}
+        params = {f"{self.key}_{i}": v for i, v in enumerate(self.values)}
+        placeholders = ",".join(f":{name}" for name in params)
+        alias = f"{self.key}_pl"  # derived from key, not hardcoded, so two link-text
+        # rules folded into one combined clause can never alias-collide
+        return (
+            f"""AND EXISTS (
+                SELECT 1 FROM page_links {alias}
+                WHERE {alias}.link_id = {link_id_column}
+                  AND ({alias}.link_text IS NULL
+                       OR TRIM(LOWER({alias}.link_text)) NOT IN ({placeholders}))
+            )""",
+            params,
+        )
+
+
+BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule, ...] = (
+    HostBlacklistRule(
+        key="never_check_host",
+        label="Never-checked hosts",
+        kind="host",
+        values=frozenset({"web.archive.org"}),
+        reason=(
+            "Chronically slow/timeout-prone; each attempt burns a full "
+            "CHECK_TIMEOUT_SECONDS for no benefit. Still crawled and stored, just "
+            "never due for a check."
+        ),
+    ),
+    LinkTextBlacklistRule(
+        key="source_citation",
+        label="Source-citation link text",
+        kind="link text",
+        values=frozenset({"source", "source)", "(source)"}),
+        reason=(
+            "Anchor text marking a citation/attribution link (\"here's where we got "
+            "this lesson material from\"), not a link students are meant to click - "
+            "both sites pair these with an explicit \"do not click\" disclaimer. "
+            "Never checked, and only excluded when every reference to the link uses "
+            "this text - a link cited as \"source\" on one page but a real course "
+            "link on another must still show up as a problem."
+        ),
+    ),
+)
+
+
+def exclusion_clause(
+    host_column: str = "host", link_id_column: str = "links.id"
+) -> tuple[str, dict[str, str]]:
+    """Combined SQL fragment (starting with "AND") plus its merged named params, from
+    every rule in BLACKLIST_RULES - splice into a query's WHERE clause via an
+    f-string and merge the params into that query's params dict. Empty string/dict if
+    no rule contributes, so it's always safe to splice in unconditionally.
     """
-    params = {f"never_check_{i}": host for i, host in enumerate(NEVER_CHECK_HOSTS)}
-    if not params:
-        return "", {}
-    placeholders = ",".join(f":{name}" for name in params)
-    return f"AND {host_column} NOT IN ({placeholders})", params
-
-# Anchor text used site-wide to mark a citation/attribution link ("here's where we got
-# this lesson material from") rather than a link students are meant to click - both
-# sites pair these with an explicit "NOTE: Do NOT click on 'source' links" disclaimer in
-# the page content. A link is only excluded from reporting if *every* page_links row
-# referencing it uses one of these literal (trimmed, lowercased) texts - see
-# source_citation_link_clause. These links are still crawled and checked normally, just
-# left out of the broken/unreachable report so they don't compete for attention with
-# links that actually need fixing.
-SOURCE_CITATION_LINK_TEXTS = frozenset({"source", "source)", "(source)"})
-
-
-def source_citation_link_clause(link_id_column: str = "links.id") -> tuple[str, dict[str, str]]:
-    """SQL fragment (starting with "AND") plus its named params, excluding links whose
-    every page_links reference uses SOURCE_CITATION_LINK_TEXTS - splice into a query's
-    WHERE clause the same way as never_check_host_clause.
-
-    Keeps the link only if at least one page_links row referencing it uses text
-    outside the citation set (i.e. it has at least one legitimate, non-citation use) -
-    a link cited as "source" on one page but a real course link on another must still
-    show up as a problem.
-    """
-    params = {f"source_citation_{i}": text for i, text in enumerate(SOURCE_CITATION_LINK_TEXTS)}
-    placeholders = ",".join(f":{name}" for name in params)
-    return (
-        f"""AND EXISTS (
-            SELECT 1 FROM page_links source_check_pl
-            WHERE source_check_pl.link_id = {link_id_column}
-              AND (source_check_pl.link_text IS NULL
-                   OR TRIM(LOWER(source_check_pl.link_text)) NOT IN ({placeholders}))
-        )""",
-        params,
-    )
+    fragments: list[str] = []
+    params: dict[str, str] = {}
+    for rule in BLACKLIST_RULES:
+        fragment, rule_params = rule.sql_clause(host_column=host_column, link_id_column=link_id_column)
+        if fragment:
+            fragments.append(fragment)
+            params.update(rule_params)
+    return "\n          ".join(fragments), params
 
 # Per-domain concurrency and rate limiting are enforced in SQL against domain_state/
 # domain_claims (see schema.sql, checker.claim_checkable_links) - not in-process

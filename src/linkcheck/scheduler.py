@@ -7,7 +7,6 @@ import logging
 import os
 import signal
 import sqlite3
-from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -85,12 +84,9 @@ async def crawl_loop(
 
 
 def _write_dashboard(conn: sqlite3.Connection, dashboard_path: str) -> None:
-    summaries = report.get_site_summaries(conn)
     problem_links = report.get_problem_links(conn)
     watch_links = report.get_watch_links(conn)
-    html = report.render_html_report(
-        summaries, problem_links, watch_links, datetime.now(UTC).isoformat()
-    )
+    html = report.render_html_report(problem_links, watch_links)
     # Write-then-rename so a reader never loads a half-written file, and a crash
     # mid-write leaves the previous dashboard intact rather than a truncated one.
     path = Path(dashboard_path)

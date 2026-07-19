@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -209,8 +208,7 @@ def report_command(db_path: str, html_path: str | None) -> None:
         watch_links = report.get_watch_links(conn)
         click.echo(report.render_text_report(summaries, problem_links, watch_links))
         if html_path:
-            generated_at = datetime.now(UTC).isoformat()
-            html = report.render_html_report(summaries, problem_links, watch_links, generated_at)
+            html = report.render_html_report(problem_links, watch_links)
             out_path = Path(html_path)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(html)

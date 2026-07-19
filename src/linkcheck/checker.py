@@ -23,7 +23,7 @@ from linkcheck.config import (
     RECHECK_JITTER_FRACTION,
     UNCONFIRMED_RETRY_MINUTES,
     USER_AGENT,
-    never_check_host_clause,
+    exclusion_clause,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,17 +227,17 @@ def get_due_links(conn: sqlite3.Connection, now: datetime, batch_size: int) -> l
     """Due links, ignoring per-domain admission entirely - a plain read, not a claim.
     Used for inspection/reporting; the check phase itself uses claim_checkable_links.
     """
-    never_check_clause, never_check_params = never_check_host_clause("host")
+    exclude_clause, exclude_params = exclusion_clause("host")
     rows = conn.execute(
         f"""
         SELECT id, url, host, status, consecutive_failures FROM links
         WHERE next_check_at <= :now
           AND EXISTS (SELECT 1 FROM page_links WHERE page_links.link_id = links.id)
-          {never_check_clause}
+          {exclude_clause}
         ORDER BY next_check_at
         LIMIT :batch_size
         """,
-        {"now": now.isoformat(), "batch_size": batch_size, **never_check_params},
+        {"now": now.isoformat(), "batch_size": batch_size, **exclude_params},
     ).fetchall()
     return [
         DueLink(
@@ -282,7 +282,7 @@ def _candidate_hosts(
     # So instead: find which hosts have any claimable work with one cheap pass (DISTINCT
     # over the due/eligible/rate-ok rows - no ranking, no per-host amplification), then
     # fetch each such host's earliest rows separately (see _gather_candidates).
-    never_check_clause, never_check_params = never_check_host_clause("links.host")
+    exclude_clause, exclude_params = exclusion_clause("links.host")
     return [
         row["host"]
         for row in conn.execute(
@@ -297,9 +297,9 @@ def _candidate_hosts(
               )
               AND (domain_state.last_request_started_at IS NULL
                    OR domain_state.last_request_started_at <= :rate_threshold)
-              {never_check_clause}
+              {exclude_clause}
             """,
-            {"now": now_iso, "rate_threshold": rate_threshold, **never_check_params},
+            {"now": now_iso, "rate_threshold": rate_threshold, **exclude_params},
         ).fetchall()
     ]
 
@@ -329,7 +329,13 @@ def _gather_candidates(
     """The earliest-due, still-claimable rows for each candidate host, capped per host at
     its remaining concurrency and globally at `limit`. Each per-host fetch is a bounded
     indexed seek (idx_links_host_next_check), so cost is independent of backlog depth.
+
+    Re-applies exclusion_clause() here even though _candidate_hosts already filtered
+    at the host level - a link-text rule (e.g. source-citation) excludes individual
+    links, not whole hosts, so a host can still have both claimable and excluded links
+    mixed together.
     """
+    exclude_clause, exclude_params = exclusion_clause("host")
     host_inflight = _host_inflight_counts(conn, hosts)
     candidates: list[sqlite3.Row] = []
     for host in hosts:
@@ -338,7 +344,7 @@ def _gather_candidates(
             continue
         candidates.extend(
             conn.execute(
-                """
+                f"""
                 SELECT id, url, host, status, consecutive_failures, next_check_at
                 FROM links INDEXED BY idx_links_host_next_check
                 WHERE host = :host
@@ -347,10 +353,11 @@ def _gather_candidates(
                   AND NOT EXISTS (
                       SELECT 1 FROM domain_claims WHERE domain_claims.link_id = links.id
                   )
+                  {exclude_clause}
                 ORDER BY next_check_at
                 LIMIT :remaining_capacity
                 """,
-                {"host": host, "now": now_iso, "remaining_capacity": remaining_capacity},
+                {"host": host, "now": now_iso, "remaining_capacity": remaining_capacity, **exclude_params},
             ).fetchall()
         )
     candidates.sort(key=lambda row: row["next_check_at"])

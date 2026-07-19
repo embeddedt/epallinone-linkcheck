@@ -31,6 +31,11 @@ next due, on its own per-link schedule. They never block each other.
 - `config.py` — site definitions + every tuning constant (crawl interval, check batch
   size, concurrency caps, timeouts, confirm-before-flagging retry schedule, healthy/broken
   recheck intervals). No env-var layer; change values here and redeploy.
+  `BLACKLIST_RULES` is the standardized mechanism for links that should never be
+  checked or reported at all (by host or by anchor text) — hardcoded, not DB-backed;
+  `exclusion_clause()` folds every rule into one SQL fragment spliced into both the
+  check-phase queries (`checker.py`) and the report queries (`report.py`), and the
+  same rules are listed on the dashboard.
 - `db.py` — schema init + connection helpers.
 - `crawler.py` — course discovery (scrape index page), page fetch (WP REST API
   `/wp-json/wp/v2/pages?slug=...` → `content.rendered`), link extraction (BeautifulSoup,
@@ -48,7 +53,10 @@ next due, on its own per-link schedule. They never block each other.
   dashboard (`templates/status.html.jinja`). Dashboard is fully static (embedded JSON,
   client-side filtering) — no backend, no live queries on page load. Rendered dashboards
   land in `public/` (gitignored); `public/assets/` holds the static files (logo) the
-  template references, checked into the repo.
+  template references, checked into the repo. After changing `report.py` or
+  `templates/status.html.jinja`, regenerate `public/status.html` (`uv run linkcheck
+  report --html public/status.html` against the existing `linkcheck.db`) so the user can
+  open it in a browser and test.
 - `cli.py` — click entry points.
 
 ### Data model

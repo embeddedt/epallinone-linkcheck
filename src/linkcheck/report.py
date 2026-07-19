@@ -14,15 +14,15 @@ from urllib.parse import quote
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from linkcheck import checker
-from linkcheck.config import never_check_host_clause, source_citation_link_clause
+from linkcheck.config import BLACKLIST_RULES, exclusion_clause
 
 NOT_OK_STATUSES = ("broken", "unreachable")
 
 
 def _named_in(prefix: str, values: tuple[str, ...]) -> tuple[str, dict[str, str]]:
     """A comma-separated named-placeholder list plus its params, for an IN (...) clause -
-    keeps every report query on named params so config.never_check_host_clause (also
-    named) can splice in without mixing param styles.
+    keeps every report query on named params so config.exclusion_clause (also named)
+    can splice in without mixing param styles.
     """
     params = {f"{prefix}_{i}": v for i, v in enumerate(values)}
     return ",".join(f":{name}" for name in params), params
@@ -48,6 +48,7 @@ class PageRef:
     page_title: str
     page_url: str
     page_order: int
+    page_last_crawled_at: str | None
     day_context: str | None
     day_number: int | None
     day_label: str | None
@@ -58,6 +59,7 @@ class PageRef:
 
 @dataclass(frozen=True)
 class LinkReportRow:
+    id: int
     url: str
     host: str
     status: str
@@ -86,6 +88,7 @@ class PageGroup:
     site_slug: str
     page_title: str
     page_url: str
+    last_crawled_at: str | None
     entries: list[PageGroupEntry]
 
 
@@ -118,10 +121,12 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
     """
     groups: dict[tuple[str, str, str], list[PageGroupEntry]] = {}
     order_keys: dict[tuple[str, str, str], tuple[int, int]] = {}
+    last_crawled_ats: dict[tuple[str, str, str], str | None] = {}
     for link in links:
         for page in link.pages:
             key = (page.site_slug, page.page_title, page.page_url)
             order_keys[key] = (page.site_order, page.page_order)
+            last_crawled_ats[key] = page.page_last_crawled_at
             groups.setdefault(key, []).append(
                 PageGroupEntry(
                     link=link,
@@ -138,6 +143,7 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
             site_slug=slug,
             page_title=title,
             page_url=url,
+            last_crawled_at=last_crawled_ats[(slug, title, url)],
             entries=sorted(entries, key=_day_sort_key),
         )
         for (slug, title, url), entries in sorted(
@@ -165,8 +171,7 @@ def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
     """
     site_slugs = [row["slug"] for row in conn.execute("SELECT slug FROM sites ORDER BY slug")]
 
-    never_clause, never_params = never_check_host_clause("links.host")
-    source_clause, source_params = source_citation_link_clause("links.id")
+    exclude_clause, exclude_params = exclusion_clause("links.host", "links.id")
     notok_placeholders, notok_params = _named_in("notok", NOT_OK_STATUSES)
 
     # One grouped pass over the site<->link join: per-status counts and the separate
@@ -187,11 +192,10 @@ def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
         JOIN page_links ON page_links.page_id = pages.id
         JOIN links ON links.id = page_links.link_id
         WHERE 1=1
-          {never_clause}
-          {source_clause}
+          {exclude_clause}
         GROUP BY sites.slug
         """,
-        {**notok_params, **never_params, **source_params},
+        {**notok_params, **exclude_params},
     ).fetchall()
     by_slug = {row["slug"]: row for row in rows}
 
@@ -233,6 +237,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
                page_links.context_before AS context_before,
                page_links.context_after AS context_after,
                pages.title AS page_title, pages.url AS page_url, pages.id AS page_id,
+               pages.last_crawled_at AS page_last_crawled_at,
                sites.slug AS site_slug, sites.id AS site_id
         FROM page_links
         JOIN pages ON pages.id = page_links.page_id
@@ -252,6 +257,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
                 page_title=row["page_title"],
                 page_url=row["page_url"],
                 page_order=row["page_id"],
+                page_last_crawled_at=row["page_last_crawled_at"],
                 day_context=row["day_context"],
                 day_number=row["day_number"],
                 day_label=row["day_label"],
@@ -263,6 +269,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
 
     return [
         LinkReportRow(
+            id=row["id"],
             url=row["url"],
             host=row["host"],
             status=row["status"],
@@ -292,11 +299,11 @@ def get_check_progress(conn: sqlite3.Connection) -> CheckProgress:
     """How many checkable links have been checked at least once, out of the total.
 
     Scoped to the same population claim_checkable_links draws from (referenced from
-    at least one page, host not in NEVER_CHECK_HOSTS) - an orphaned or never-checked
-    link never gets checked again, so counting it would keep the percentage from ever
-    reaching 100.
+    at least one page, not matching any config.BLACKLIST_RULES rule) - an orphaned or
+    blacklisted link never gets checked again, so counting it would keep the
+    percentage from ever reaching 100.
     """
-    never_clause, never_params = never_check_host_clause("host")
+    exclude_clause, exclude_params = exclusion_clause("host", "links.id")
     row = conn.execute(
         f"""
         SELECT
@@ -304,9 +311,9 @@ def get_check_progress(conn: sqlite3.Connection) -> CheckProgress:
             SUM(CASE WHEN last_checked_at IS NOT NULL THEN 1 ELSE 0 END) AS checked
         FROM links
         WHERE EXISTS (SELECT 1 FROM page_links WHERE page_links.link_id = links.id)
-          {never_clause}
+          {exclude_clause}
         """,
-        never_params,
+        exclude_params,
     ).fetchone()
     return CheckProgress(checked=row["checked"] or 0, total=row["total"] or 0)
 
@@ -315,8 +322,8 @@ def _link_rows(
     conn: sqlite3.Connection, where: str, order_by: str, params: dict[str, str]
 ) -> list[LinkReportRow]:
     """Shared skeleton for the broken and watching link lists: same column set,
-    NEVER_CHECK_HOSTS exclusion, and current-page-links requirement, differing only in
-    the WHERE predicate and ORDER BY.
+    config.BLACKLIST_RULES exclusion, and current-page-links requirement, differing
+    only in the WHERE predicate and ORDER BY.
 
     The page-links requirement matters beyond just hiding stale rows: a link that's
     lost every page association is also excluded from the check queue (see
@@ -324,23 +331,17 @@ def _link_rows(
     last check before losing its page(s) would sit in the watching/broken lists
     forever with nothing to click through to and no future check that could ever
     confirm or clear it.
-
-    Also excludes source-citation links (see source_citation_link_clause) - a link
-    used purely as a "here's where we got this from" attribution isn't something
-    anyone needs to fix.
     """
-    never_clause, never_params = never_check_host_clause("host")
-    source_clause, source_params = source_citation_link_clause("links.id")
+    exclude_clause, exclude_params = exclusion_clause("host", "links.id")
     link_rows = conn.execute(
         f"""
         SELECT {_LINK_COLUMNS} FROM links
         WHERE {where}
-          {never_clause}
-          {source_clause}
+          {exclude_clause}
           AND EXISTS (SELECT 1 FROM page_links WHERE page_links.link_id = links.id)
         ORDER BY {order_by}
         """,
-        {**params, **never_params, **source_params},
+        {**params, **exclude_params},
     ).fetchall()
     return _rows_with_pages(conn, link_rows)
 
@@ -364,7 +365,7 @@ def get_watch_links(conn: sqlite3.Connection) -> list[LinkReportRow]:
     be a transient blip, or might be about to graduate into get_problem_links() on
     its next failed retry.
 
-    Excludes NEVER_CHECK_HOSTS: a link on one of those hosts that failed once will
+    Excludes config.BLACKLIST_RULES matches: a blacklisted link that failed once will
     never get the recheck that would confirm or clear it, so it would otherwise sit
     here forever looking like an unresolved transient blip.
     """
@@ -478,26 +479,29 @@ def render_text_report(
     return "\n".join(lines)
 
 
+def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
+    word = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {word}"
+
+
 _env = Environment(
     loader=PackageLoader("linkcheck", "templates"),
     autoescape=select_autoescape(["html"]),
 )
 _env.filters["outcome"] = _outcome
+_env.filters["pluralize"] = _pluralize
 _env.globals["found_on_href"] = found_on_href
 
 
 def render_html_report(
-    summaries: list[SiteSummary],
     problem_links: list[LinkReportRow],
     watch_links: list[LinkReportRow],
-    generated_at: str,
 ) -> str:
     template = _env.get_template("status.html.jinja")
     return template.render(
-        summaries=summaries,
         problem_links=problem_links,
         problem_groups=_group_by_page(problem_links),
         watch_links=watch_links,
         watch_groups=_group_by_page(watch_links),
-        generated_at=generated_at,
+        blacklist_rules=BLACKLIST_RULES,
     )

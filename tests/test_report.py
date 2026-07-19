@@ -155,7 +155,7 @@ def test_get_problem_links_excludes_orphaned_links(conn):
 def test_get_problem_links_excludes_source_citation_links(conn, text):
     # Both sites mark citation/attribution links with literal anchor text "source"
     # (styled and disclaimed as "do not click" in the page content itself) - these
-    # should never show up as something to fix. See config.source_citation_link_clause.
+    # should never show up as something to fix. See config.BLACKLIST_RULES.
     _sync(
         conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
         [ExtractedLink(url="https://ext.example.com/citation", text=text, day_context=None)],
@@ -297,15 +297,19 @@ def test_render_html_report_contains_expected_content(conn):
     _confirm_broken(conn)
 
     html = report.render_html_report(
-        report.get_site_summaries(conn),
         report.get_problem_links(conn),
         report.get_watch_links(conn),
-        "2026-01-01T00:00:00",
     )
     assert "<html" in html
     assert "https://ext.example.com/broken" in html
     assert "Math 1" in html
-    assert "2026-01-01T00:00:00" in html
+
+
+def test_dashboard_shows_blacklist_configuration():
+    html = report.render_html_report([], [])
+    assert "Never-checked hosts" in html
+    assert "web.archive.org" in html
+    assert "Source-citation link text" in html
 
 
 def test_render_html_report_shows_watching_section(conn):
@@ -316,10 +320,8 @@ def test_render_html_report_shows_watching_section(conn):
     _check_all_due(conn, CheckResult(404, None, 10))
 
     html = report.render_html_report(
-        report.get_site_summaries(conn),
         report.get_problem_links(conn),
         report.get_watch_links(conn),
-        "2026-01-01T00:00:00",
     )
     assert "Watching" in html
     assert "https://ext.example.com/flaky" in html
@@ -327,9 +329,9 @@ def test_render_html_report_shows_watching_section(conn):
 
 
 def test_render_html_report_empty_state(conn):
-    html = report.render_html_report([], [], [], "2026-01-01T00:00:00")
+    html = report.render_html_report([], [])
     assert "No broken or unreachable links." in html
-    assert "Watching (" not in html  # section itself is skipped; summary column header still says "Watching"
+    assert "Watching (" not in html  # section itself is skipped when watch_links is empty
 
 
 def _entry(day_context=None, day_label=None, link_text=None, context_before=None, context_after=None):
@@ -345,7 +347,11 @@ def _entry(day_context=None, day_label=None, link_text=None, context_before=None
 
 
 _GROUP = report.PageGroup(
-    site_slug="highschool", page_title="Chemistry", page_url="https://allinonehighschool.com/chemistry/", entries=[]
+    site_slug="highschool",
+    page_title="Chemistry",
+    page_url="https://allinonehighschool.com/chemistry/",
+    last_crawled_at=None,
+    entries=[],
 )
 
 
