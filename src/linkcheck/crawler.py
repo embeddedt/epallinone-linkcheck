@@ -344,6 +344,12 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     that, it would silently jump to the wrong week. day_context is dropped (left None)
     for any day id that isn't unique on the page, rather than emit an anchor that
     points somewhere else on the page than the link it's meant to locate.
+
+    Links with no visible anchor text (image-only/icon anchors, or anchors
+    wrapping only whitespace) are dropped entirely rather than stored with a
+    blank link_text - there's nothing to show a human trying to locate the
+    link on the live page, and no way to disambiguate one from another if the
+    same URL is linked without text in multiple places.
     """
     soup = BeautifulSoup(html, "lxml")
     base_host = urlparse(site_base_url).netloc.lower()
@@ -367,13 +373,16 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         absolute = _fix_missing_slash(urljoin(page_url, href)).split("#", 1)[0]
         if not absolute or urlparse(absolute).netloc.lower() == base_host:
             continue
+        link_text = _visible_text(node)
+        if not link_text:
+            continue  # image-only/icon anchors with no visible text aren't worth reporting on
         day_context = current_day if current_day and day_id_counts[current_day] == 1 else None
         context_before, context_after = _link_context(node)
         seen.setdefault(
             absolute,
             ExtractedLink(
                 url=absolute,
-                text=_visible_text(node),
+                text=link_text,
                 day_context=day_context,
                 context_before=context_before,
                 context_after=context_after,

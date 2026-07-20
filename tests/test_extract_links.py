@@ -226,12 +226,13 @@ def test_extract_links_context_does_not_cross_block_boundary():
     assert link.context_after is None
 
 
-def test_extract_links_context_none_when_link_has_no_text():
-    html = '<p>before text <a href="https://ext.example.com/img"><img src="x.png"></a> after text</p>'
+def test_extract_links_drops_links_with_no_visible_text():
+    html = (
+        '<p>before text <a href="https://ext.example.com/img"><img src="x.png"></a> after text '
+        '<a href="https://ext.example.com/blank">   </a></p>'
+    )
     links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
-    assert len(links) == 1
-    assert links[0].context_before is None
-    assert links[0].context_after is None
+    assert links == []
 
 
 def test_extract_links_context_truncation_never_splits_a_word():
