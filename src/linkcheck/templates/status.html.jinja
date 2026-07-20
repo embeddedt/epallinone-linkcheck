@@ -75,7 +75,7 @@
   {% for group in problem_groups %}
   <tbody class="course-group" data-group-key="problem:{{ group.page_url }}">
     <tr class="group-header">
-      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> (<span class="group-count" data-singular="broken link">{{ group.entries|length|pluralize('broken link') }}</span>){% if group.last_crawled_at %} &mdash; last crawled <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
+      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> (<span class="group-count" data-singular="broken link">{{ group.entries|length|pluralize('broken link') }}</span>){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
     </tr>
     {% for entry in group.entries %}
     <tr class="row" data-status="{{ entry.link.status }}" data-link-id="{{ entry.link.id }}"
@@ -133,7 +133,7 @@
   {% for group in watch_groups %}
   <tbody class="course-group" data-group-key="watch:{{ group.page_url }}">
     <tr class="group-header">
-      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> ({{ group.entries|length|pluralize('watched link') }}){% if group.last_crawled_at %} &mdash; last crawled <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
+      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> ({{ group.entries|length|pluralize('watched link') }}){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
     </tr>
     {% for entry in group.entries %}
     <tr>
