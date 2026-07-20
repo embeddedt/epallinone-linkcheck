@@ -14,7 +14,7 @@ from urllib.parse import quote
 from jinja2 import Environment, PackageLoader, select_autoescape
 
 from linkcheck import checker
-from linkcheck.config import BLACKLIST_RULES, exclusion_clause
+from linkcheck.config import BLACKLIST_RULES, DESIGN_EXCLUSIONS, exclusion_clause
 
 NOT_OK_STATUSES = ("broken", "unreachable")
 
@@ -504,4 +504,5 @@ def render_html_report(
         watch_links=watch_links,
         watch_groups=_group_by_page(watch_links),
         blacklist_rules=BLACKLIST_RULES,
+        design_exclusions=DESIGN_EXCLUSIONS,
     )

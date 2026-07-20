@@ -186,7 +186,7 @@
 
 {% if blacklist_rules %}
 <h3>Excluded by configuration</h3>
-<p>Links matching a rule below are never checked and never appear in the lists above (see <code>config.py</code>).</p>
+<p>Links matching a rule below are never checked and never appear in the lists above.</p>
 <table id="blacklist-table">
   <thead>
     <tr>
@@ -203,6 +203,27 @@
       <td>{{ rule.kind }}</td>
       <td>{{ rule.values|sort|join(', ') }}</td>
       <td>{{ rule.reason }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if design_exclusions %}
+<h3>Excluded by design</h3>
+<p>These never enter the database at all - dropped during crawling/checking as a structural rule, not a configurable one.</p>
+<table id="design-exclusions-table">
+  <thead>
+    <tr>
+      <th>Rule</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for exclusion in design_exclusions %}
+    <tr>
+      <td>{{ exclusion.label }}</td>
+      <td>{{ exclusion.reason }}</td>
     </tr>
     {% endfor %}
   </tbody>

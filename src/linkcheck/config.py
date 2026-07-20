@@ -100,9 +100,9 @@ BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule, ...] = (
         kind="host",
         values=frozenset({"web.archive.org"}),
         reason=(
-            "Chronically slow/timeout-prone; each attempt burns a full "
-            "CHECK_TIMEOUT_SECONDS for no benefit. Still crawled and stored, just "
-            "never due for a check."
+            "Chronically slow/timeout-prone; each attempt burns the full request "
+            "timeout for no benefit. Still crawled and stored, just never due for a "
+            "check."
         ),
     ),
     LinkTextBlacklistRule(
@@ -117,6 +117,48 @@ BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule, ...] = (
             "Never checked, and only excluded when every reference to the link uses "
             "this text - a link cited as \"source\" on one page but a real course "
             "link on another must still show up as a problem."
+        ),
+    ),
+)
+
+
+@dataclass(frozen=True)
+class DesignExclusion:
+    label: str  # short display name, for the dashboard
+    reason: str  # human sentence, for the dashboard
+
+
+# Exclusions baked into the crawl/check logic itself rather than expressed as a
+# BLACKLIST_RULES entry - unlike that list, this one drives nothing; it exists purely
+# so the dashboard can document behavior that would otherwise look like a bug ("why
+# isn't this obviously-broken link showing up?"). Not derived from code, so keep it in
+# sync by hand whenever crawler.py/checker.py extraction logic changes.
+DESIGN_EXCLUSIONS: tuple[DesignExclusion, ...] = (
+    DesignExclusion(
+        label="No visible link text",
+        reason=(
+            "Image-only/icon anchors, and anchors wrapping only whitespace, are "
+            "dropped at crawl time - there's nothing to show a human trying to "
+            "locate the link on the live page."
+        ),
+    ),
+    DesignExclusion(
+        label="Same-site links",
+        reason=(
+            "Only links to a different host are tracked at all - same-site PDFs, "
+            "answer keys, and other leaf pages are out of scope."
+        ),
+    ),
+    DesignExclusion(
+        label="Fragment / mailto / tel / javascript hrefs",
+        reason="Same-page anchor jumps and non-HTTP link types are never real link checks.",
+    ),
+    DesignExclusion(
+        label="Orphaned links",
+        reason=(
+            "A link no longer referenced by any current page (removed or replaced on "
+            "a recrawl) drops out of the check queue - kept in the database in case "
+            "it reappears, but never rechecked or reported while orphaned."
         ),
     ),
 )
@@ -186,7 +228,7 @@ CHECK_PROGRESS_LOG_SECONDS = 30
 UNCONFIRMED_RETRY_MINUTES = (60, 24 * 60)  # 1 hour after the 1st failure, 1 day after the 2nd
 
 HEALTHY_RECHECK_DAYS = 7  # recheck interval once a link is confirmed ok
-BROKEN_RECHECK_DAYS = 7  # recheck interval once a link is confirmed broken/unreachable
+BROKEN_RECHECK_DAYS = 1  # recheck interval once a link is confirmed broken/unreachable
 
 # Links confirmed together (e.g. an entire crawl batch) get the same next_check_at, and
 # with a fixed interval they'd stay locked in that cohort forever - recreating the same
