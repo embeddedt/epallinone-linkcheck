@@ -235,6 +235,86 @@ async def test_check_link_connect_error_bad_ssl_cert_is_classified_from_cause():
     assert result.error_type == "bad_ssl_cert"
 
 
+# --- AIA chase recovery from a bad_ssl_cert connect error ---
+#
+# aia.chase() itself is covered offline in test_aia.py; here we only need to check
+# that check_link() wires a successful/failed chase into the right CheckResult. A
+# dummy (not None) ssl.SSLContext stands in for a "chase succeeded" signal, and
+# _aia_retry_client is monkeypatched so the retry hits a MockTransport instead of a
+# real socket - see conftest.py for why the default (unpatched) path is already safe.
+
+
+def _bad_cert_handler(request):
+    raise httpx.ConnectError(
+        "certificate verify failed", request=request
+    ) from ssl.SSLCertVerificationError()
+
+
+@pytest.mark.asyncio
+async def test_check_link_recovers_via_aia_chase_when_retry_succeeds(monkeypatch):
+    async def fake_chase(client, host, port, *, leaf_cert_der=None):
+        return ssl.create_default_context()
+
+    monkeypatch.setattr(linkcheck.checker.aia, "chase", fake_chase)
+    monkeypatch.setattr(
+        linkcheck.checker,
+        "_aia_retry_client",
+        lambda ctx: _client(lambda request: httpx.Response(200)),
+    )
+
+    async with _client(_bad_cert_handler) as client:
+        result = await check_link(client, "https://x.test/bad-cert")
+
+    assert result.http_status == 200
+    assert result.error_type is None
+
+
+@pytest.mark.asyncio
+async def test_check_link_falls_back_to_bad_ssl_cert_when_chase_retry_still_fails(monkeypatch):
+    async def fake_chase(client, host, port, *, leaf_cert_der=None):
+        return ssl.create_default_context()
+
+    def still_fails(request):
+        raise httpx.ConnectError("still broken", request=request)
+
+    monkeypatch.setattr(linkcheck.checker.aia, "chase", fake_chase)
+    monkeypatch.setattr(linkcheck.checker, "_aia_retry_client", lambda ctx: _client(still_fails))
+
+    async with _client(_bad_cert_handler) as client:
+        result = await check_link(client, "https://x.test/bad-cert")
+
+    assert result.error_type == "bad_ssl_cert"
+
+
+@pytest.mark.asyncio
+async def test_check_link_falls_back_to_bad_ssl_cert_when_chase_cannot_complete_chain(
+    monkeypatch,
+):
+    async def chase_gives_up(client, host, port, *, leaf_cert_der=None):
+        return None
+
+    monkeypatch.setattr(linkcheck.checker.aia, "chase", chase_gives_up)
+
+    async with _client(_bad_cert_handler) as client:
+        result = await check_link(client, "https://x.test/bad-cert")
+
+    assert result.error_type == "bad_ssl_cert"
+
+
+@pytest.mark.asyncio
+async def test_check_link_skips_aia_chase_entirely_when_disabled(monkeypatch):
+    def chase_should_not_be_called(*args, **kwargs):
+        raise AssertionError("chase() must not run when CHECK_AIA_CHASE is off")
+
+    monkeypatch.setattr(linkcheck.checker, "CHECK_AIA_CHASE", False)
+    monkeypatch.setattr(linkcheck.checker.aia, "chase", chase_should_not_be_called)
+
+    async with _client(_bad_cert_handler) as client:
+        result = await check_link(client, "https://x.test/bad-cert")
+
+    assert result.error_type == "bad_ssl_cert"
+
+
 @pytest.mark.asyncio
 async def test_check_link_bare_value_error_is_caught_as_other():
     # A malformed URL can make httpx raise a bare ValueError (deep in urllib cookie

@@ -201,6 +201,17 @@ CHECK_MAX_REDIRECTS = 10
 # check_link back to checking each URL exactly as stored, with no upgrade attempt.
 CHECK_HTTPS_UPGRADE = True
 
+# Some servers serve an incomplete or misordered intermediate chain (a valid leaf cert,
+# but nothing linking it to a trusted root) - real browsers paper over this by fetching
+# the missing intermediate themselves via the cert's Authority Information Access
+# extension (AIA chasing) rather than failing the connection, so a link that every
+# visitor's browser reaches fine would otherwise get misreported as broken. See
+# linkcheck.aia. Off falls back to the plain bad_ssl_cert classification with no retry.
+CHECK_AIA_CHASE = True
+AIA_CHASE_TIMEOUT_SECONDS = 10
+AIA_CHASE_MAX_HOPS = 5  # generous cap on chain length; guards against a pathological
+                        # or cyclical AIA reference chain rather than trusting one blindly
+
 # A domain_claims row older than this is treated as an abandoned claim from a crashed
 # process and purged rather than trusted - comfortably above CHECK_TIMEOUT_SECONDS so
 # a genuinely slow-but-alive check is never mistaken for one.

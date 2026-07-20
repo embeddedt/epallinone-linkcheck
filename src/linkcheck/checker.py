@@ -15,8 +15,10 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
+from linkcheck import aia
 from linkcheck.config import (
     BROKEN_RECHECK_DAYS,
+    CHECK_AIA_CHASE,
     CHECK_HTTPS_UPGRADE,
     CHECK_ONESHOT_POLL_SECONDS,
     HEALTHY_RECHECK_DAYS,
@@ -101,6 +103,40 @@ def _classify_connect_error(exc: BaseException) -> str:
     return ERROR_OTHER
 
 
+def _aia_retry_client(ctx: ssl.SSLContext) -> httpx.AsyncClient:
+    """Split out from _fetch_via_aia_chase so tests can substitute a
+    MockTransport-backed client for the retry instead of a real one."""
+    return httpx.AsyncClient(verify=ctx)
+
+
+async def _fetch_via_aia_chase(url: str) -> CheckResult | None:
+    """After a bad_ssl_cert connect error, try to recover by fetching the server's
+    missing intermediate certificate(s) ourselves (see linkcheck.aia) and retrying
+    once against a completed chain. Returns None - falling back to the original
+    bad_ssl_cert result - if AIA chasing can't complete the chain, or the retry
+    still fails for any reason (including a *different* cert problem, e.g. the leaf
+    itself being expired/self-signed, that AIA chasing was never going to fix).
+    """
+    parsed = httpx.URL(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    async with httpx.AsyncClient() as aia_client:
+        ctx = await aia.chase(aia_client, parsed.host, port)
+    if ctx is None:
+        return None
+
+    start = time.monotonic()
+    try:
+        async with _aia_retry_client(ctx) as retry_client:
+            async with retry_client.stream(
+                "GET", url, headers={"User-Agent": USER_AGENT}, follow_redirects=True
+            ) as response:
+                return CheckResult(
+                    response.status_code, None, int((time.monotonic() - start) * 1000)
+                )
+    except httpx.RequestError:
+        return None
+
+
 async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
     """One GET attempt against url. Streams the response and closes after headers -
     never downloads the full body, since we only care about the status code.
@@ -120,7 +156,12 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
     except httpx.TimeoutException:
         return CheckResult(None, ERROR_TIMEOUT, elapsed_ms())
     except httpx.ConnectError as exc:
-        return CheckResult(None, _classify_connect_error(exc), elapsed_ms())
+        error_type = _classify_connect_error(exc)
+        if CHECK_AIA_CHASE and error_type == ERROR_BAD_SSL_CERT:
+            chased = await _fetch_via_aia_chase(url)
+            if chased is not None:
+                return chased
+        return CheckResult(None, error_type, elapsed_ms())
     except httpx.RequestError:
         return CheckResult(None, ERROR_OTHER, elapsed_ms())
     except ValueError:
