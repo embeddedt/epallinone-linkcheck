@@ -9,6 +9,7 @@ uv sync                                  # install deps
 uv run linkcheck init-db                 # create tables, seed site config
 uv run linkcheck crawl --limit 5         # crawl a few course pages per site
 uv run linkcheck check --batch-size 50   # check whatever's due
+uv run linkcheck requeue-broken          # pull next_check_at forward to now for broken/unreachable links
 uv run linkcheck report --html public/status.html
 uv run linkcheck run                     # long-lived worker: crawl loop + check loop together
 

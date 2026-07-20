@@ -251,6 +251,22 @@ def get_due_links(conn: sqlite3.Connection, now: datetime, batch_size: int) -> l
     ]
 
 
+def pull_forward_broken_links(conn: sqlite3.Connection, now: datetime) -> int:
+    """Set next_check_at to now for every confirmed broken/unreachable link that isn't
+    already due, so the next check cycle reconsiders all of them immediately instead
+    of waiting out whatever recheck interval was in effect when each was last
+    confirmed (e.g. after tightening BROKEN_RECHECK_DAYS, which only affects
+    scheduling decisions made from that point on - see next_state). Returns the number
+    of links pulled forward.
+    """
+    with conn:
+        cursor = conn.execute(
+            "UPDATE links SET next_check_at = :now WHERE status IN (:broken, :unreachable) AND next_check_at > :now",
+            {"now": now.isoformat(), "broken": STATUS_BROKEN, "unreachable": STATUS_UNREACHABLE},
+        )
+    return cursor.rowcount
+
+
 @dataclass(frozen=True)
 class AdmissionControl:
     """Per-domain admission-control tuning, always applied together (see

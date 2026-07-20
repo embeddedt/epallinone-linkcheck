@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -181,6 +182,28 @@ def check_command(db_path: str, batch_size: int) -> None:
 
     try:
         asyncio.run(run())
+    finally:
+        conn.close()
+
+
+@main.command("requeue-broken")
+@click.option(
+    "--db-path",
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the SQLite database file.",
+)
+def requeue_broken_command(db_path: str) -> None:
+    """Pull next_check_at forward to now for every broken/unreachable link.
+
+    Use this after changing the recheck cadence (e.g. BROKEN_RECHECK_DAYS) to apply it
+    to links already scheduled under the old value, instead of waiting for their
+    existing schedule to catch up on its own.
+    """
+    conn = db.connect(db_path)
+    try:
+        count = checker.pull_forward_broken_links(conn, datetime.now(UTC))
+        click.echo(f"Requeued {count} broken/unreachable links for immediate recheck")
     finally:
         conn.close()
 

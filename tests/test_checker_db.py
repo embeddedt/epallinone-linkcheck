@@ -9,6 +9,7 @@ from linkcheck.checker import (
     CheckResult,
     claim_checkable_links,
     get_due_links,
+    pull_forward_broken_links,
     record_check,
     release_claim,
 )
@@ -147,6 +148,42 @@ def test_record_check_recovering_link_resets_to_ok(conn):
     row = conn.execute("SELECT * FROM links WHERE id = ?", (link.id,)).fetchone()
     assert row["status"] == "ok"
     assert row["consecutive_failures"] == 0
+
+
+# --- pull_forward_broken_links() ---
+
+
+def test_pull_forward_broken_links_pulls_forward_broken_and_unreachable_links(conn):
+    broken_id = seed_link(conn, url="https://ext.example.com/broken")
+    unreachable_id = seed_link(conn, url="https://ext.example.com/unreachable")
+    ok_id = seed_link(conn, url="https://ext.example.com/ok")
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+    conn.execute("UPDATE links SET status = 'broken', next_check_at = ? WHERE id = ?", (future, broken_id))
+    conn.execute("UPDATE links SET status = 'unreachable', next_check_at = ? WHERE id = ?", (future, unreachable_id))
+    conn.execute("UPDATE links SET status = 'ok', next_check_at = ? WHERE id = ?", (future, ok_id))
+    conn.commit()
+
+    now = datetime.now(UTC)
+    count = pull_forward_broken_links(conn, now)
+    assert count == 2
+
+    rows = {row["id"]: row["next_check_at"] for row in conn.execute("SELECT id, next_check_at FROM links")}
+    assert rows[broken_id] == now.isoformat()
+    assert rows[unreachable_id] == now.isoformat()
+    assert rows[ok_id] == future  # untouched - not broken/unreachable
+
+
+def test_pull_forward_broken_links_does_not_recount_already_due_links(conn):
+    broken_id = seed_link(conn, url="https://ext.example.com/broken")
+    past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    conn.execute("UPDATE links SET status = 'broken', next_check_at = ? WHERE id = ?", (past, broken_id))
+    conn.commit()
+
+    count = pull_forward_broken_links(conn, datetime.now(UTC))
+    assert count == 0  # already due, nothing to pull forward
+
+    row = conn.execute("SELECT next_check_at FROM links WHERE id = ?", (broken_id,)).fetchone()
+    assert row["next_check_at"] == past  # left alone
 
 
 # --- claim_checkable_links() / release_claim() ---
