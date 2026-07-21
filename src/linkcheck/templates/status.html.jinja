@@ -80,6 +80,7 @@
     {% for entry in group.entries %}
     <tr class="row" data-status="{{ entry.link.status }}" data-link-id="{{ entry.link.id }}"
         data-occurrence-id="{{ group.page_url }}::{{ entry.link.id }}::{{ entry.day_context }}"
+        data-last-checked-at="{{ entry.link.last_checked_at or '' }}"
         data-course="{{ group.site_slug }}: {{ group.page_title }}"
         data-link-text="{{ entry.link_text or '' }}"
         data-context-before="{{ entry.context_before or '' }}"
@@ -238,7 +239,7 @@
 
   function rowMatchesFilter(row) {
     if (!row.classList.contains("row")) return true;
-    if (row.dataset.occurrenceId && doneIds.has(row.dataset.occurrenceId)) return false;
+    if (row.dataset.occurrenceId && Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) return false;
     var q = (search && search.value || "").toLowerCase();
     var matchesStatus = activeStatus === "all" || row.dataset.status === activeStatus;
     var matchesSearch = !q || row.dataset.search.indexOf(q) !== -1;
@@ -278,41 +279,75 @@
 
   var DONE_STORAGE_KEY = "linkcheck.markedDone";
 
-  function loadDoneIds() {
+  // doneMap maps occurrence id -> the link's last_checked_at at the moment it was
+  // marked done. A link stays hidden only until it's actually rechecked again - if it
+  // resurfaces in problem_links (still broken/unreachable) with a newer
+  // last_checked_at, that's a fresh confirmation, not the one the user already saw,
+  // so it should reappear rather than stay suppressed forever.
+  function loadDoneMap() {
     try {
-      return new Set(JSON.parse(localStorage.getItem(DONE_STORAGE_KEY) || "[]"));
+      var parsed = JSON.parse(localStorage.getItem(DONE_STORAGE_KEY) || "{}");
+      if (Array.isArray(parsed)) return null; // legacy format, handled by migration below
+      return parsed && typeof parsed === "object" ? parsed : {};
     } catch (e) {
-      return new Set();
+      return {};
     }
   }
 
-  function saveDoneIds() {
+  function saveDoneMap() {
     try {
-      localStorage.setItem(DONE_STORAGE_KEY, JSON.stringify(Array.from(doneIds)));
+      localStorage.setItem(DONE_STORAGE_KEY, JSON.stringify(doneMap));
     } catch (e) {}
   }
 
-  var doneIds = loadDoneIds();
+  var legacyDoneIds = loadDoneMap();
+  var doneMap = legacyDoneIds === null ? {} : legacyDoneIds;
   var problemTable = document.getElementById("problem-table");
   var doneTbody = document.getElementById("marked-done-tbody");
   var doneWrapper = document.getElementById("marked-done-wrapper");
 
-  // One-time migration: doneIds used to be bare link ids (shared across every
-  // occurrence of that link), now they're per-occurrence ids ("pageUrl::linkId::day").
-  // Expand any surviving bare-link-id entries into that link's current occurrence ids
-  // so links already marked done stay marked done instead of reappearing.
+  // One-time migration from older storage formats: a bare Set of ids, which were
+  // either one entry per link (oldest format) or one entry per occurrence (the format
+  // right before snapshots were added). Expand/convert into the current occurrence-id
+  // -> last_checked_at map, snapshotting each row's current last_checked_at so already
+  // dismissed links don't immediately reappear just because of this format change -
+  // they'll still reappear the next time they're genuinely rechecked, same as any
+  // other marked-done link going forward.
   (function migrateLegacyDoneIds() {
-    if (!problemTable) return;
-    var legacyIds = Array.from(doneIds).filter(function (id) { return id.indexOf("::") === -1; });
-    if (!legacyIds.length) return;
+    if (legacyDoneIds !== null || !problemTable) return;
+    var raw;
+    try {
+      raw = JSON.parse(localStorage.getItem(DONE_STORAGE_KEY) || "[]");
+    } catch (e) {
+      raw = [];
+    }
+    if (!Array.isArray(raw) || !raw.length) return;
     var rows = Array.from(problemTable.querySelectorAll("tr.row[data-link-id]"));
-    legacyIds.forEach(function (legacyId) {
-      doneIds.delete(legacyId);
+    raw.forEach(function (id) {
+      var isBareLinkId = id.indexOf("::") === -1;
       rows.forEach(function (row) {
-        if (row.dataset.linkId === legacyId) doneIds.add(row.dataset.occurrenceId);
+        var matches = isBareLinkId ? row.dataset.linkId === id : row.dataset.occurrenceId === id;
+        if (matches) doneMap[row.dataset.occurrenceId] = row.dataset.lastCheckedAt || "";
       });
     });
-    saveDoneIds();
+    saveDoneMap();
+  })();
+
+  // Resurface anything that's been rechecked since it was marked done - the checker
+  // ran again and it's still showing up here, so it's a fresh failure the user hasn't
+  // seen yet, not the one they dismissed.
+  (function reconcileDoneMap() {
+    if (!problemTable) return;
+    var changed = false;
+    problemTable.querySelectorAll("tr.row[data-occurrence-id]").forEach(function (row) {
+      var occId = row.dataset.occurrenceId;
+      if (!Object.prototype.hasOwnProperty.call(doneMap, occId)) return;
+      if (doneMap[occId] !== (row.dataset.lastCheckedAt || "")) {
+        delete doneMap[occId];
+        changed = true;
+      }
+    });
+    if (changed) saveDoneMap();
   })();
 
   function renderDoneSection() {
@@ -320,10 +355,10 @@
     doneTbody.innerHTML = "";
     var pruned = false;
     var allRows = problemTable ? Array.from(problemTable.querySelectorAll("tr.row[data-occurrence-id]")) : [];
-    doneIds.forEach(function (id) {
+    Object.keys(doneMap).forEach(function (id) {
       var row = allRows.find(function (r) { return r.dataset.occurrenceId === id; });
       if (!row) {
-        doneIds.delete(id);
+        delete doneMap[id];
         pruned = true;
         return;
       }
@@ -346,7 +381,7 @@
 
       doneTbody.appendChild(clone);
     });
-    if (pruned) saveDoneIds();
+    if (pruned) saveDoneMap();
     if (doneWrapper) doneWrapper.style.display = doneTbody.children.length ? "" : "none";
   }
 
@@ -360,7 +395,7 @@
       if (!span) return;
       var remaining = 0;
       group.querySelectorAll("tr.row[data-occurrence-id]").forEach(function (row) {
-        if (!doneIds.has(row.dataset.occurrenceId)) remaining++;
+        if (!Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) remaining++;
       });
       span.textContent = pluralize(remaining, span.dataset.singular);
     });
@@ -372,7 +407,7 @@
       // A link still counts as outstanding if any of its occurrences hasn't been marked done.
       var remainingIds = new Set();
       problemTable.querySelectorAll("tr.row[data-link-id]").forEach(function (row) {
-        if (!doneIds.has(row.dataset.occurrenceId)) remainingIds.add(row.dataset.linkId);
+        if (!Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) remainingIds.add(row.dataset.linkId);
       });
       problemCount.textContent = remainingIds.size;
     }
@@ -430,8 +465,9 @@
     problemTable.addEventListener("click", function (event) {
       var doneBtn = event.target.closest(".mark-done-btn");
       if (doneBtn) {
-        doneIds.add(doneBtn.dataset.occurrenceId);
-        saveDoneIds();
+        var doneRow = doneBtn.closest("tr");
+        doneMap[doneBtn.dataset.occurrenceId] = doneRow.dataset.lastCheckedAt || "";
+        saveDoneMap();
         refreshVisibility();
         renderDoneSection();
         updateGroupCounts();
@@ -451,8 +487,8 @@
     doneTbody.addEventListener("click", function (event) {
       var btn = event.target.closest(".undo-done-btn");
       if (!btn) return;
-      doneIds.delete(btn.dataset.occurrenceId);
-      saveDoneIds();
+      delete doneMap[btn.dataset.occurrenceId];
+      saveDoneMap();
       refreshVisibility();
       renderDoneSection();
       updateGroupCounts();
