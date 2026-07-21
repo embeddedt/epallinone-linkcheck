@@ -58,9 +58,8 @@
     <col style="width: 8%">
     <col style="width: 10%">
     <col style="width: 27%">
-    <col style="width: 35%">
-    <col style="width: 7%">
-    <col style="width: 13%">
+    <col style="width: 40%">
+    <col style="width: 15%">
   </colgroup>
   <thead>
     <tr>
@@ -68,14 +67,13 @@
       <th>Reason</th>
       <th>Link name</th>
       <th>Broken link</th>
-      <th>Failures</th>
       <th></th>
     </tr>
   </thead>
   {% for group in problem_groups %}
   <tbody class="course-group" data-group-key="problem:{{ group.page_url }}">
     <tr class="group-header">
-      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> (<span class="group-count" data-singular="broken link">{{ group.entries|length|pluralize('broken link') }}</span>){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
+      <td colspan="5">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> (<span class="group-count" data-singular="broken link">{{ group.entries|length|pluralize('broken link') }}</span>){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
     </tr>
     {% for entry in group.entries %}
     <tr class="row" data-status="{{ entry.link.status }}" data-link-id="{{ entry.link.id }}"
@@ -88,7 +86,6 @@
         (<a href="{{ found_on_href(group, entry) }}" target="_blank" rel="noopener noreferrer">{% if entry.day_context %}jump to {{ entry.day_label or entry.day_context }}{% else %}view on page{% endif %}</a>)
       </td>
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
-      <td>{{ entry.link.consecutive_failures }}</td>
       <td>
         {% if entry.link.last_checked_at %}
         <time class="relative-time" datetime="{{ entry.link.last_checked_at }}">{{ entry.link.last_checked_at }}</time>
@@ -117,8 +114,7 @@
     <col style="width: 10%">
     <col style="width: 27%">
     <col style="width: 35%">
-    <col style="width: 7%">
-    <col style="width: 13%">
+    <col style="width: 20%">
   </colgroup>
   <thead>
     <tr>
@@ -126,14 +122,13 @@
       <th>Reason</th>
       <th>Link name</th>
       <th>Link</th>
-      <th>Failures</th>
       <th>Next check</th>
     </tr>
   </thead>
   {% for group in watch_groups %}
   <tbody class="course-group" data-group-key="watch:{{ group.page_url }}">
     <tr class="group-header">
-      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> ({{ group.entries|length|pluralize('watched link') }}){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
+      <td colspan="5">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> ({{ group.entries|length|pluralize('watched link') }}){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
     </tr>
     {% for entry in group.entries %}
     <tr>
@@ -144,7 +139,6 @@
         (<a href="{{ found_on_href(group, entry) }}" target="_blank" rel="noopener noreferrer">{% if entry.day_context %}jump to {{ entry.day_label or entry.day_context }}{% else %}view on page{% endif %}</a>)
       </td>
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
-      <td>{{ entry.link.consecutive_failures }}</td>
       <td><time class="relative-time" datetime="{{ entry.link.next_check_at }}">{{ entry.link.next_check_at }}</time></td>
     </tr>
     {% endfor %}
@@ -166,8 +160,7 @@
     <col style="width: 9%">
     <col style="width: 22%">
     <col style="width: 30%">
-    <col style="width: 8%">
-    <col style="width: 10%">
+    <col style="width: 18%">
   </colgroup>
   <thead>
     <tr>
@@ -176,7 +169,6 @@
       <th>Reason</th>
       <th>Link name</th>
       <th>Broken link</th>
-      <th>Failures</th>
       <th></th>
     </tr>
   </thead>
