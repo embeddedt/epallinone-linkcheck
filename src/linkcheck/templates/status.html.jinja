@@ -79,6 +79,7 @@
     </tr>
     {% for entry in group.entries %}
     <tr class="row" data-status="{{ entry.link.status }}" data-link-id="{{ entry.link.id }}"
+        data-occurrence-id="{{ group.page_url }}::{{ entry.link.id }}::{{ entry.day_context }}"
         data-course="{{ group.site_slug }}: {{ group.page_title }}"
         data-link-text="{{ entry.link_text or '' }}"
         data-context-before="{{ entry.context_before or '' }}"
@@ -96,7 +97,7 @@
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
       <td>
         <div class="row-actions">
-          <button type="button" class="mark-done-btn" data-link-id="{{ entry.link.id }}">Mark done</button>
+          <button type="button" class="mark-done-btn" data-occurrence-id="{{ group.page_url }}::{{ entry.link.id }}::{{ entry.day_context }}">Mark done</button>
           <button type="button" class="copy-blurb-btn" data-link-id="{{ entry.link.id }}">Copy info blurb</button>
         </div>
       </td>
@@ -237,7 +238,7 @@
 
   function rowMatchesFilter(row) {
     if (!row.classList.contains("row")) return true;
-    if (row.dataset.linkId && doneIds.has(row.dataset.linkId)) return false;
+    if (row.dataset.occurrenceId && doneIds.has(row.dataset.occurrenceId)) return false;
     var q = (search && search.value || "").toLowerCase();
     var matchesStatus = activeStatus === "all" || row.dataset.status === activeStatus;
     var matchesSearch = !q || row.dataset.search.indexOf(q) !== -1;
@@ -296,26 +297,42 @@
   var doneTbody = document.getElementById("marked-done-tbody");
   var doneWrapper = document.getElementById("marked-done-wrapper");
 
+  // One-time migration: doneIds used to be bare link ids (shared across every
+  // occurrence of that link), now they're per-occurrence ids ("pageUrl::linkId::day").
+  // Expand any surviving bare-link-id entries into that link's current occurrence ids
+  // so links already marked done stay marked done instead of reappearing.
+  (function migrateLegacyDoneIds() {
+    if (!problemTable) return;
+    var legacyIds = Array.from(doneIds).filter(function (id) { return id.indexOf("::") === -1; });
+    if (!legacyIds.length) return;
+    var rows = Array.from(problemTable.querySelectorAll("tr.row[data-link-id]"));
+    legacyIds.forEach(function (legacyId) {
+      doneIds.delete(legacyId);
+      rows.forEach(function (row) {
+        if (row.dataset.linkId === legacyId) doneIds.add(row.dataset.occurrenceId);
+      });
+    });
+    saveDoneIds();
+  })();
+
   function renderDoneSection() {
     if (!doneTbody) return;
     doneTbody.innerHTML = "";
     var pruned = false;
+    var allRows = problemTable ? Array.from(problemTable.querySelectorAll("tr.row[data-occurrence-id]")) : [];
     doneIds.forEach(function (id) {
-      var matches = problemTable
-        ? problemTable.querySelectorAll('tr.row[data-link-id="' + id + '"]')
-        : [];
-      if (!matches.length) {
+      var row = allRows.find(function (r) { return r.dataset.occurrenceId === id; });
+      if (!row) {
         doneIds.delete(id);
         pruned = true;
         return;
       }
-      var courses = Array.from(new Set(Array.from(matches).map(function (row) { return row.dataset.course; })));
-      var clone = matches[0].cloneNode(true);
+      var clone = row.cloneNode(true);
       clone.classList.remove("row");
       clone.removeAttribute("style");
 
       var courseCell = document.createElement("td");
-      courseCell.textContent = courses.join(", ");
+      courseCell.textContent = row.dataset.course;
       clone.insertBefore(courseCell, clone.firstChild);
 
       var lastCell = clone.lastElementChild;
@@ -323,7 +340,7 @@
       var undoBtn = document.createElement("button");
       undoBtn.type = "button";
       undoBtn.className = "undo-done-btn";
-      undoBtn.dataset.linkId = id;
+      undoBtn.dataset.occurrenceId = id;
       undoBtn.textContent = "Undo";
       lastCell.appendChild(undoBtn);
 
@@ -342,8 +359,8 @@
       var span = group.querySelector(".group-count");
       if (!span) return;
       var remaining = 0;
-      group.querySelectorAll("tr.row[data-link-id]").forEach(function (row) {
-        if (!doneIds.has(row.dataset.linkId)) remaining++;
+      group.querySelectorAll("tr.row[data-occurrence-id]").forEach(function (row) {
+        if (!doneIds.has(row.dataset.occurrenceId)) remaining++;
       });
       span.textContent = pluralize(remaining, span.dataset.singular);
     });
@@ -352,9 +369,10 @@
     if (problemTable && problemCount) {
       // problem_links (and this heading) count unique links, not page occurrences -
       // a link on multiple course pages produces one row per page but must only count once.
+      // A link still counts as outstanding if any of its occurrences hasn't been marked done.
       var remainingIds = new Set();
       problemTable.querySelectorAll("tr.row[data-link-id]").forEach(function (row) {
-        if (!doneIds.has(row.dataset.linkId)) remainingIds.add(row.dataset.linkId);
+        if (!doneIds.has(row.dataset.occurrenceId)) remainingIds.add(row.dataset.linkId);
       });
       problemCount.textContent = remainingIds.size;
     }
@@ -412,7 +430,7 @@
     problemTable.addEventListener("click", function (event) {
       var doneBtn = event.target.closest(".mark-done-btn");
       if (doneBtn) {
-        doneIds.add(doneBtn.dataset.linkId);
+        doneIds.add(doneBtn.dataset.occurrenceId);
         saveDoneIds();
         refreshVisibility();
         renderDoneSection();
@@ -433,7 +451,7 @@
     doneTbody.addEventListener("click", function (event) {
       var btn = event.target.closest(".undo-done-btn");
       if (!btn) return;
-      doneIds.delete(btn.dataset.linkId);
+      doneIds.delete(btn.dataset.occurrenceId);
       saveDoneIds();
       refreshVisibility();
       renderDoneSection();
