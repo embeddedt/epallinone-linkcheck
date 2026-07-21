@@ -345,8 +345,21 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     not just the first lesson overall). `id` values are supposed to be unique, so a
     `#dayN` link only takes a browser to the *first* matching element - on a page like
     that, it would silently jump to the wrong week. day_context is dropped (left None)
-    for any day id that isn't unique on the page, rather than emit an anchor that
-    points somewhere else on the page than the link it's meant to locate.
+    for any day id whose occurrences aren't all one contiguous run (see
+    `_marker_run_counts` below), rather than emit an anchor that points somewhere else
+    on the page than the link it's meant to locate.
+
+    A day id repeating isn't always that same-id-different-week case, though: some
+    pages (e.g. Science Year 4, Bible Geography & Cultures) tag more than one *sibling*
+    element within a single lesson with that lesson's own id - a "Materials: ..." callout
+    div right after the heading div, or an empty spacer div right before it, each
+    carrying the same `id="dayN"` as the heading itself. Jumping to `#dayN` still lands
+    a reader in the right lesson there (the first, correct occurrence), since nothing
+    else's marker sits between the repeats - unlike the genuine cross-week reuse case,
+    where a *different* day's marker appears between one "day1" and the next. Counting
+    contiguous runs of the same id (`_marker_run_counts`) rather than raw occurrences
+    tells these apart: a same-lesson repeat collapses into one run and stays trusted, a
+    cross-week reuse still spans more than one run and gets dropped.
 
     Links with no visible anchor text (image-only/icon anchors, or anchors
     wrapping only whitespace) are dropped entirely rather than stored with a
@@ -358,10 +371,43 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     more than one day section of the same page (a shared reference site, a recurring
     game) is a distinct occurrence per day, each needing its own fix if it breaks, so
     each one is kept rather than collapsing onto whichever occurrence came first.
+
+    Several courses (Spanish 2, Oceanography, Chemistry/Physics/Earth Science with Lab)
+    carry a leftover, spurious `id="day1"` nested *inside* every lesson's real, correctly
+    numbered marker - e.g. `<strong id="day2"><strong id="day1">Lesson</strong> 2*</strong>`,
+    apparently from copy-pasting Lesson 1's markup as the starting point for every later
+    lesson without removing its id. Left alone, that would both flood day_id_counts with
+    bogus "day1" occurrences (tripping the duplicate-id guard below for lesson 1 itself)
+    and, since descendants are visited outer-then-inner, overwrite current_day with that
+    spurious inner id right after the real outer one was set - so `_is_nested_marker`
+    ignores any id-bearing tag that sits inside another id-bearing tag, keeping only the
+    outer (real) marker. This is separate from - and does not affect - the genuine
+    duplicate-id case just below, which is about sibling markers, not nested ones.
     """
     soup = BeautifulSoup(html, "lxml")
     base_host = urlparse(site_base_url).netloc.lower()
-    day_id_counts = Counter(node.get("id") for node in soup.find_all(id=DAY_ID_RE))
+
+    def _is_nested_marker(node: Tag) -> bool:
+        return node.find_parent(id=DAY_ID_RE) is not None
+
+    def _marker_run_counts(marker_nodes: list[Tag]) -> Counter:
+        """Count contiguous runs of each id among marker_nodes (already in document
+        order), collapsing consecutive repeats of the same id into a single run - see
+        the "Materials:"-callout/spacer-div case in extract_links's docstring for why
+        that's what actually determines whether `#dayN` is safe to use as an anchor.
+        """
+        counts: Counter = Counter()
+        previous_id: str | None = None
+        for node in marker_nodes:
+            node_id = node.get("id")
+            if node_id != previous_id:
+                counts[node_id] += 1
+            previous_id = node_id
+        return counts
+
+    day_id_counts = _marker_run_counts(
+        [node for node in soup.find_all(id=DAY_ID_RE) if not _is_nested_marker(node)]
+    )
 
     current_day: str | None = None
     current_day_label: str | None = None
@@ -370,9 +416,15 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         if not isinstance(node, Tag):
             continue
         node_id = node.get("id")
-        if node_id and DAY_ID_RE.match(node_id):
+        if node_id and DAY_ID_RE.match(node_id) and not _is_nested_marker(node):
+            # A repeat of the *same* id (the "Materials:"-callout/spacer-div case) is
+            # still this same lesson, not a new one - its label is re-derived only on
+            # a genuine change of id, so a non-title sibling marker (e.g. a materials
+            # callout with no "Lesson N" text of its own) can't clobber the real label
+            # the heading marker already set.
+            if node_id != current_day:
+                current_day_label = _day_label(node)
             current_day = node_id
-            current_day_label = _day_label(node)
         if node.name != "a":
             continue
         href = (node.get("href") or "").strip()

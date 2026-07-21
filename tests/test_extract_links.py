@@ -219,6 +219,68 @@ def test_extract_links_drops_day_context_when_id_repeats_on_page():
     assert by_url["https://ext.example.com/week1b"] == "day2"  # unique id is unaffected
 
 
+def test_extract_links_keeps_day_context_when_id_repeats_within_the_same_lesson():
+    # real markup seen on Science Year 4/Bible Geography & Cultures: a "Materials: ..."
+    # callout div (or an empty spacer div) right next to the heading carries the same
+    # id as the lesson heading itself - a true sibling duplicate, but #dayN still lands
+    # a reader in the right lesson since nothing else's marker sits between the repeats
+    html = """
+    <div id="day6"><strong>Lesson 6</strong></div>
+    <div id="day6"><strong>(Materials: cup, water)</strong></div>
+    <a href="https://ext.example.com/experiment">experiment</a>
+    <div id="day7"><strong>Lesson 7</strong></div>
+    <a href="https://ext.example.com/next">next</a>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    by_url = {link.url: link for link in links}
+    assert by_url["https://ext.example.com/experiment"].day_context == "day6"
+    assert by_url["https://ext.example.com/experiment"].day_label == "Lesson 6"
+    assert by_url["https://ext.example.com/next"].day_context == "day7"
+
+
+def test_extract_links_drops_day_context_when_repeated_id_spans_another_days_marker():
+    # the same repeated-id shape as above, but this time day1 recurs *after* day2's own
+    # marker has already appeared in between - a genuine cross-week reuse, not a
+    # same-lesson sibling repeat, so it must still be dropped
+    html = """
+    <div id="day1"><a href="https://ext.example.com/week1">week1 link</a></div>
+    <div id="day2"><a href="https://ext.example.com/week1b">week1 day2 link</a></div>
+    <div id="day1"><a href="https://ext.example.com/week2a">week2 link a</a></div>
+    <div id="day1"><a href="https://ext.example.com/week2b">week2 link b</a></div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    by_url = {link.url: link.day_context for link in links}
+    assert by_url["https://ext.example.com/week1"] is None
+    assert by_url["https://ext.example.com/week2a"] is None
+    assert by_url["https://ext.example.com/week2b"] is None
+    assert by_url["https://ext.example.com/week1b"] == "day2"
+
+
+def test_extract_links_ignores_spurious_nested_marker_left_over_from_copy_paste():
+    # real markup seen on chemistry/oceanography/physics/earth-science/spanish-2: every
+    # lesson after the first carries a leftover id="day1" nested inside its own,
+    # correctly numbered marker - apparently Lesson 1's markup got copy-pasted as the
+    # starting point for every later lesson without removing its id. The outer,
+    # correctly numbered id must win, not the spurious nested one, and it must not
+    # count towards day1's uniqueness either.
+    html = """
+    <p><strong id="day1">Lesson 1</strong></p>
+    <a href="https://ext.example.com/lesson1">one</a>
+    <p><strong id="day2"><strong id="day1">Lesson</strong> 2*</strong></p>
+    <a href="https://ext.example.com/lesson2">two</a>
+    <p><strong id="day3"><strong id="day1">Lesson</strong> 3</strong></p>
+    <a href="https://ext.example.com/lesson3">three</a>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    by_url = {link.url: link for link in links}
+    assert by_url["https://ext.example.com/lesson1"].day_context == "day1"
+    assert by_url["https://ext.example.com/lesson1"].day_label == "Lesson 1"
+    assert by_url["https://ext.example.com/lesson2"].day_context == "day2"
+    assert by_url["https://ext.example.com/lesson2"].day_label == "Lesson 2*"
+    assert by_url["https://ext.example.com/lesson3"].day_context == "day3"
+    assert by_url["https://ext.example.com/lesson3"].day_label == "Lesson 3"
+
+
 def test_extract_links_keeps_one_occurrence_per_day_for_a_repeated_url():
     # the same resource (a shared reference site, a recurring game) linked from more
     # than one day section is a distinct occurrence per day, not a single link to
