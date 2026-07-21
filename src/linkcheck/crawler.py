@@ -21,10 +21,12 @@ from linkcheck.config import CRAWL_CONCURRENCY, CRAWL_REQUEST_DELAY_SECONDS, USE
 logger = logging.getLogger(__name__)
 
 CONTENT_SELECTOR = ".entry-content"
-DAY_ID_RE = re.compile(r"^day\d+$", re.IGNORECASE)
+# "day" is the original/most common marker id; "week" is the same convention used
+# throughout the PE/Health, Art, Music, and Computer courses instead of numbering by day.
+DAY_ID_RE = re.compile(r"^(?:day|week)\d+$", re.IGNORECASE)
 _MISSING_SLASH_RE = re.compile(r"^(https?):/(?!/)", re.IGNORECASE)
 _WHITESPACE_RE = re.compile(r"\s+")
-_DAY_TITLE_RE = re.compile(r"(?:lesson|day)\s*\d+\*?", re.IGNORECASE)
+_DAY_TITLE_RE = re.compile(r"(?:lesson|day|week)\s*\d+\*?", re.IGNORECASE)
 
 
 def _visible_text(tag: Tag) -> str:
@@ -332,9 +334,10 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     extraction itself - `content.rendered` already excludes theme chrome, so
     every `<a href>` in it is course content.
 
-    Day context (the nearest preceding `id="dayN"`, however it's marked up -
-    `<div id="dayN">` on one site, `<strong id="dayN">` on the other) is
-    captured best-effort purely so reports can say "Math 1, Day 47" instead
+    Day context (the nearest preceding `id="dayN"` or `id="weekN"` - the latter is the
+    PE/Health, Art, Music, and Computer courses' convention instead of numbering by day -
+    however it's marked up: `<div id="dayN">` on one site, `<strong id="dayN">` on
+    another) is captured best-effort purely so reports can say "Math 1, Day 47" instead
     of just "Math 1" - extraction does not depend on it.
 
     Some course pages reuse the same day id once per week instead of numbering days

@@ -188,6 +188,21 @@ def test_extract_links_day_label_supports_legacy_day_n_convention():
     assert links[0].day_label == "Day 9"
 
 
+def test_extract_links_supports_week_n_id_convention():
+    # PE/Health, Art, Music, and Computer courses mark lessons as id="weekN" instead
+    # of id="dayN" - same shape, just a different word, and each id is unique per page
+    html = """
+    <div id="week1"><p><strong>Week 1</strong></p><a href="https://ext.example.com/a">a</a></div>
+    <div id="week2"><p><strong>Week 2</strong></p><a href="https://ext.example.com/b">b</a></div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    by_url = {link.url: link for link in links}
+    assert by_url["https://ext.example.com/a"].day_context == "week1"
+    assert by_url["https://ext.example.com/a"].day_label == "Week 1"
+    assert by_url["https://ext.example.com/b"].day_context == "week2"
+    assert by_url["https://ext.example.com/b"].day_label == "Week 2"
+
+
 def test_extract_links_drops_day_context_when_id_repeats_on_page():
     # a course that reuses "day1" once per week instead of numbering days uniquely -
     # #day1 would take a browser to the first (wrong) occurrence, so links near the
