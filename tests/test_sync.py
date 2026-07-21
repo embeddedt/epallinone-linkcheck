@@ -208,6 +208,42 @@ def test_sync_stores_and_updates_surrounding_context(conn):
     assert row["context_after"] == "before continuing"
 
 
+def test_sync_tracks_same_link_on_multiple_days_as_separate_occurrences(conn):
+    # the bug this guards against: a link referenced from more than one day section of
+    # the same page used to collapse onto a single page_links row, so the report only
+    # ever showed one occurrence even when the link was broken on several days
+    first_crawl = [
+        ExtractedLink(url="https://ext.example.com/shared", text="shared", day_context="day12"),
+        ExtractedLink(url="https://ext.example.com/shared", text="shared", day_context="day30"),
+        ExtractedLink(url="https://ext.example.com/shared", text="shared", day_context="day47"),
+    ]
+    sync_course_page(conn, "homeschool", make_page(), first_crawl)
+
+    page_id = conn.execute("SELECT id FROM pages").fetchone()["id"]
+    rows = conn.execute(
+        "SELECT day_context FROM page_links WHERE page_id = ?", (page_id,)
+    ).fetchall()
+    assert {r["day_context"] for r in rows} == {"day12", "day30", "day47"}
+
+    assert len(rows) == 3  # one link, three distinct rows - not collapsed to one
+
+    link_id = conn.execute(
+        "SELECT id FROM links WHERE url = 'https://ext.example.com/shared'"
+    ).fetchone()["id"]
+
+    # fixed on day12 and day30 (URL removed from those sections) but left broken on day47
+    second_crawl = [
+        ExtractedLink(url="https://ext.example.com/shared", text="shared", day_context="day47"),
+    ]
+    sync_course_page(conn, "homeschool", make_page(), second_crawl)
+
+    remaining = conn.execute(
+        "SELECT day_context FROM page_links WHERE page_id = ? AND link_id = ?",
+        (page_id, link_id),
+    ).fetchall()
+    assert {r["day_context"] for r in remaining} == {"day47"}  # only the unfixed day survives
+
+
 def test_sync_unknown_site_raises(conn):
     with pytest.raises(ValueError, match="Unknown site slug"):
         sync_course_page(conn, "nonexistent", make_page(), [])

@@ -197,6 +197,46 @@ async def test_crawl_site_skips_full_fetch_for_unchanged_page():
     assert results[0].unchanged is True
     assert results[0].link_count == 1  # unchanged link_count comes from the existing page_links row
 
+
+@pytest.mark.asyncio
+async def test_crawl_site_force_does_full_fetch_even_when_unchanged():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    seeded = CoursePage(
+        wp_id=1, slug="ep-math-1", canonical_url="https://allinonehomeschool.com/ep-math-1/",
+        title="Math 1", html="<p>x</p>", modified_gmt="2023-05-26T19:33:31",
+    )
+    sync_course_page(
+        conn, "homeschool", seeded,
+        [ExtractedLink(url="https://ext.example.com/a", text="a", day_context=None)],
+    )
+
+    def wp_handler(request):
+        # force=True must skip the cheap modified_gmt check (no "_fields" request)
+        # and go straight to a full fetch, even though modified_gmt is unchanged
+        assert "_fields" not in request.url.params
+        return httpx.Response(200, json=[{
+            "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+            "title": {"rendered": "Math 1"},
+            "content": {"rendered": '<a href="https://ext.example.com/b">b</a>'},
+            "modified_gmt": "2023-05-26T19:33:31",
+        }])
+
+    async with _crawl_client(index_html=_INDEX_HTML, wp_handler=wp_handler) as client:
+        results = await crawl_site(conn, client, _SITE, force=True)
+
+    assert len(results) == 1
+    assert results[0].found is True
+    assert results[0].unchanged is False
+    assert results[0].link_count == 1
+
+    link_urls = {
+        r["url"] for r in conn.execute(
+            "SELECT links.url FROM links JOIN page_links ON page_links.link_id = links.id"
+        )
+    }
+    assert link_urls == {"https://ext.example.com/b"}  # re-extracted, not just touched
+
     row = conn.execute("SELECT modified_gmt FROM pages WHERE slug = 'ep-math-1'").fetchone()
     assert row["modified_gmt"] == "2023-05-26T19:33:31"
 

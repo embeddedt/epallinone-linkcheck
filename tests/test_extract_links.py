@@ -18,9 +18,10 @@ def test_extract_links_div_variant_ep_math_1():
         site_base_url="https://allinonehomeschool.com",
     )
     urls = {link.url for link in links}
+    occurrences = {(link.url, link.day_context) for link in links}
 
-    assert len(links) == len(urls)  # deduped within the page
-    assert len(links) > 100  # this page has 161+ unique external links
+    assert len(links) == len(occurrences)  # deduped per (url, day) within the page
+    assert len(urls) > 100  # this page has 161+ unique external links
 
     # same-site links (worksheets, answer keys) are excluded by default
     assert not any("allinonehomeschool.com" in u for u in urls)
@@ -42,9 +43,10 @@ def test_extract_links_strong_variant_algebra_1():
         site_base_url="https://allinonehighschool.com",
     )
     urls = {link.url for link in links}
+    occurrences = {(link.url, link.day_context) for link in links}
 
-    assert len(links) == len(urls)
-    assert len(links) > 50
+    assert len(links) == len(occurrences)  # deduped per (url, day) within the page
+    assert len(urls) > 50
 
     # cross-site link to the sister domain counts as external and is kept
     assert any("allinonehomeschool.com" in u for u in urls)
@@ -200,6 +202,35 @@ def test_extract_links_drops_day_context_when_id_repeats_on_page():
     assert by_url["https://ext.example.com/week1"] is None
     assert by_url["https://ext.example.com/week2"] is None
     assert by_url["https://ext.example.com/week1b"] == "day2"  # unique id is unaffected
+
+
+def test_extract_links_keeps_one_occurrence_per_day_for_a_repeated_url():
+    # the same resource (a shared reference site, a recurring game) linked from more
+    # than one day section is a distinct occurrence per day, not a single link to
+    # dedupe away - each one needs its own fix if it breaks
+    html = """
+    <div id="day12"><a href="https://ext.example.com/reference">reference</a></div>
+    <div id="day30"><a href="https://ext.example.com/reference">reference</a></div>
+    <div id="day47"><a href="https://ext.example.com/reference">reference</a></div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    days = sorted(link.day_context for link in links)
+    assert days == ["day12", "day30", "day47"]
+    assert all(link.url == "https://ext.example.com/reference" for link in links)
+
+
+def test_extract_links_dedupes_identical_repeat_within_the_same_day():
+    # two mentions of the same URL within one day section are still just one
+    # occurrence of that link on that day - nothing to disambiguate between them
+    html = """
+    <div id="day1">
+      <a href="https://ext.example.com/x">x</a>
+      <a href="https://ext.example.com/x">x again</a>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert len(links) == 1
+    assert links[0].text == "x"  # first occurrence wins, same as before
 
 
 def test_extract_links_captures_surrounding_context():

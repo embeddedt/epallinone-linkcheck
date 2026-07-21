@@ -40,17 +40,28 @@ CREATE INDEX IF NOT EXISTS idx_links_host ON links(host);
 CREATE INDEX IF NOT EXISTS idx_links_host_next_check ON links(host, next_check_at);
 
 CREATE TABLE IF NOT EXISTS page_links (
+    id INTEGER PRIMARY KEY,
     page_id INTEGER NOT NULL REFERENCES pages(id),
     link_id INTEGER NOT NULL REFERENCES links(id),
-    day_context TEXT,                      -- best-effort nearest id="dayN"; nullable
+    day_context TEXT NOT NULL DEFAULT '',   -- best-effort nearest id="dayN"; '' when absent -
+                                            -- kept NOT NULL (rather than nullable) so it can sit
+                                            -- in the uniqueness constraint below: SQLite treats
+                                            -- every NULL as distinct, which would otherwise let
+                                            -- recrawls of a day-less page pile up duplicate rows
+                                            -- instead of upserting a single one
     day_label TEXT,                        -- friendly title for day_context (e.g. "Lesson 47"); nullable
     link_text TEXT,                        -- anchor text, for readable reports
     context_before TEXT,                   -- best-effort prose immediately before the link
     context_after TEXT,                    -- best-effort prose immediately after the link
     last_seen_at TEXT NOT NULL,
-    PRIMARY KEY (page_id, link_id)
+    -- one row per (page, link, day) occurrence, not per (page, link) - the same link can be
+    -- referenced from more than one day section of the same page (see extract_links) and each
+    -- occurrence needs its own row so the report can show, and the crawler can independently
+    -- clean up, each one
+    UNIQUE (page_id, link_id, day_context)
 );
 CREATE INDEX IF NOT EXISTS idx_page_links_link ON page_links(link_id);
+CREATE INDEX IF NOT EXISTS idx_page_links_page ON page_links(page_id);
 
 CREATE TABLE IF NOT EXISTS link_checks (
     id INTEGER PRIMARY KEY,

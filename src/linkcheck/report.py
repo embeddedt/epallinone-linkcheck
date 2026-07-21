@@ -49,7 +49,7 @@ class PageRef:
     page_url: str
     page_order: int
     page_last_crawled_at: str | None
-    day_context: str | None
+    day_context: str  # '' when the link has no day section (see schema.sql page_links)
     day_number: int | None
     day_label: str | None
     link_text: str | None
@@ -75,7 +75,7 @@ class LinkReportRow:
 @dataclass(frozen=True)
 class PageGroupEntry:
     link: LinkReportRow
-    day_context: str | None
+    day_context: str  # '' when the link has no day section (see schema.sql page_links)
     day_number: int | None
     day_label: str | None
     link_text: str | None
@@ -231,7 +231,8 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
     page_rows = conn.execute(
         f"""
         SELECT page_links.link_id AS link_id, page_links.day_context AS day_context,
-               CAST(SUBSTR(page_links.day_context, 4) AS INTEGER) AS day_number,
+               CASE WHEN page_links.day_context = '' THEN NULL
+                    ELSE CAST(SUBSTR(page_links.day_context, 4) AS INTEGER) END AS day_number,
                page_links.day_label AS day_label,
                page_links.link_text AS link_text,
                page_links.context_before AS context_before,

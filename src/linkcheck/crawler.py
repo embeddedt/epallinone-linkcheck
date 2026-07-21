@@ -350,6 +350,11 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     blank link_text - there's nothing to show a human trying to locate the
     link on the live page, and no way to disambiguate one from another if the
     same URL is linked without text in multiple places.
+
+    Deduped per (url, day_context) rather than per url alone - a resource linked from
+    more than one day section of the same page (a shared reference site, a recurring
+    game) is a distinct occurrence per day, each needing its own fix if it breaks, so
+    each one is kept rather than collapsing onto whichever occurrence came first.
     """
     soup = BeautifulSoup(html, "lxml")
     base_host = urlparse(site_base_url).netloc.lower()
@@ -357,7 +362,7 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
 
     current_day: str | None = None
     current_day_label: str | None = None
-    seen: dict[str, ExtractedLink] = {}
+    seen: dict[tuple[str, str | None], ExtractedLink] = {}
     for node in soup.descendants:
         if not isinstance(node, Tag):
             continue
@@ -379,7 +384,7 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         day_context = current_day if current_day and day_id_counts[current_day] == 1 else None
         context_before, context_after = _link_context(node)
         seen.setdefault(
-            absolute,
+            (absolute, day_context),
             ExtractedLink(
                 url=absolute,
                 text=link_text,
@@ -479,8 +484,12 @@ def sync_course_page(
     """Upsert a crawled course page and its links, and drop stale associations.
 
     Runs as one transaction: the page row, every link found on this crawl, and the
-    page<->link associations are all upserted, then any `page_links` row for a link
-    that's no longer present on the page is deleted (`DELETE ... NOT IN <current set>`).
+    page<->link associations are all upserted, then any `page_links` row for an
+    occurrence (link + day) no longer present on the page is deleted. A link can have
+    more than one page_links row per page - one per day section it's referenced from
+    (see extract_links) - so staleness is tracked per (link_id, day_context) pair, not
+    just per link_id: fixing the link on day 47 but leaving it broken on day 12 of the
+    same page must drop only day 47's row, not day 12's too.
     Links themselves are never hard-deleted here, even if a link ends up with zero
     remaining `page_links` rows after this.
     An orphaned link simply stops being selected by the check phase, since
@@ -491,18 +500,18 @@ def sync_course_page(
     with conn:
         page_id = _upsert_page(conn, site_id, page)
 
-        current_link_ids: list[int] = []
+        current_occurrences: set[tuple[int, str]] = set()
         for link in links:
             link_id = _upsert_link(conn, link.url)
-            current_link_ids.append(link_id)
+            day_context = link.day_context or ""
+            current_occurrences.add((link_id, day_context))
             conn.execute(
                 """
                 INSERT INTO page_links
                     (page_id, link_id, day_context, day_label, link_text, context_before, context_after, last_seen_at)
                 VALUES
                     (:page_id, :link_id, :day_context, :day_label, :link_text, :context_before, :context_after, :now)
-                ON CONFLICT(page_id, link_id) DO UPDATE SET
-                    day_context = excluded.day_context,
+                ON CONFLICT(page_id, link_id, day_context) DO UPDATE SET
                     day_label = excluded.day_label,
                     link_text = excluded.link_text,
                     context_before = excluded.context_before,
@@ -512,7 +521,7 @@ def sync_course_page(
                 {
                     "page_id": page_id,
                     "link_id": link_id,
-                    "day_context": link.day_context,
+                    "day_context": day_context,
                     "day_label": link.day_label,
                     "link_text": link.text,
                     "context_before": link.context_before,
@@ -521,14 +530,18 @@ def sync_course_page(
                 },
             )
 
-        if current_link_ids:
-            placeholders = ",".join("?" * len(current_link_ids))
-            conn.execute(
-                f"DELETE FROM page_links WHERE page_id = ? AND link_id NOT IN ({placeholders})",
-                (page_id, *current_link_ids),
-            )
-        else:
-            conn.execute("DELETE FROM page_links WHERE page_id = ?", (page_id,))
+        existing = conn.execute(
+            "SELECT id, link_id, day_context FROM page_links WHERE page_id = ?",
+            (page_id,),
+        ).fetchall()
+        stale_ids = [
+            row["id"]
+            for row in existing
+            if (row["link_id"], row["day_context"]) not in current_occurrences
+        ]
+        if stale_ids:
+            placeholders = ",".join("?" * len(stale_ids))
+            conn.execute(f"DELETE FROM page_links WHERE id IN ({placeholders})", stale_ids)
 
 
 @dataclass(frozen=True)
@@ -547,6 +560,7 @@ async def crawl_site(
     limit: int | None = None,
     concurrency: int = CRAWL_CONCURRENCY,
     request_delay: float = CRAWL_REQUEST_DELAY_SECONDS,
+    force: bool = False,
 ) -> list[CrawlResult]:
     """Discover, fetch, extract, and sync every course page for one site.
 
@@ -555,6 +569,11 @@ async def crawl_site(
     (tens of course pages, not the thousands of leaf pages on the full site).
     Calling the synchronous sync_course_page() from these concurrent coroutines needs
     no lock - see the shared-connection note in scheduler.py for why.
+
+    force=True skips the modified_gmt cheap-check below so every page gets a full
+    fetch/re-extract/sync regardless of whether WordPress reports it as changed - for
+    re-applying an extraction-logic change (e.g. a fixed dedup rule) to already-crawled
+    pages without waiting for their next real content edit.
     """
     courses = await discover_courses_for_site(client, site)
     if limit is not None:
@@ -571,7 +590,7 @@ async def crawl_site(
             # A page seen before gets a cheap modified_gmt check first - most course
             # pages don't change day to day, so this skips the full body fetch and
             # link re-extraction for the common case (see fetch_page_modified).
-            if known is not None and known["modified_gmt"] is not None:
+            if not force and known is not None and known["modified_gmt"] is not None:
                 current_modified = await fetch_page_modified(client, site, slug)
                 await asyncio.sleep(request_delay)
                 if current_modified is not None and current_modified == known["modified_gmt"]:
