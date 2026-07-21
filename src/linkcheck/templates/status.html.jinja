@@ -17,7 +17,9 @@
   tbody.course-group .group-header td { background: #f5f5f5; font-weight: bold; border-top: 2px solid #999; cursor: pointer; user-select: none; }
   tbody.course-group .group-header td::before { content: "\25be"; display: inline-block; margin-right: 0.5rem; }
   tbody.course-group.collapsed .group-header td::before { content: "\25b8"; }
-  .mark-done-btn, .undo-done-btn { font-size: 0.85rem; margin-top: 0.25rem; }
+  .mark-done-btn, .undo-done-btn, .copy-blurb-btn { font-size: 0.85rem; }
+  .undo-done-btn { margin-top: 0.25rem; }
+  .row-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
   #marked-done-table tbody tr { color: #666; }
 </style>
 </head>
@@ -78,6 +80,12 @@
     {% for entry in group.entries %}
     <tr class="row" data-status="{{ entry.link.status }}" data-link-id="{{ entry.link.id }}"
         data-course="{{ group.site_slug }}: {{ group.page_title }}"
+        data-link-text="{{ entry.link_text or '' }}"
+        data-context-before="{{ entry.context_before or '' }}"
+        data-context-after="{{ entry.context_after or '' }}"
+        data-reason="{{ entry.link|outcome }}"
+        data-url="{{ entry.link.url }}"
+        data-found-on="{{ found_on_href(group, entry) }}"
         data-search="{{ (entry.link.url ~ ' ' ~ entry.link.host ~ ' ' ~ group.page_title ~ ' ' ~ (entry.link_text or '') ~ ' ' ~ (entry.context_before or '') ~ ' ' ~ (entry.context_after or ''))|lower }}">
       <td>{{ entry.link.status }}</td>
       <td>{{ entry.link|outcome }}</td>
@@ -87,12 +95,10 @@
       </td>
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
       <td>
-        {% if entry.link.last_checked_at %}
-        <time class="relative-time" datetime="{{ entry.link.last_checked_at }}">{{ entry.link.last_checked_at }}</time>
-        {% else %}
-        never
-        {% endif %}
-        <br><button type="button" class="mark-done-btn" data-link-id="{{ entry.link.id }}">Mark done</button>
+        <div class="row-actions">
+          <button type="button" class="mark-done-btn" data-link-id="{{ entry.link.id }}">Mark done</button>
+          <button type="button" class="copy-blurb-btn" data-link-id="{{ entry.link.id }}">Copy info blurb</button>
+        </div>
       </td>
     </tr>
     {% endfor %}
@@ -354,15 +360,72 @@
     }
   }
 
+  function buildInfoBlurb(row) {
+    var lines = [
+      row.dataset.course,
+      'Link: "' + (row.dataset.linkText || "(no visible link text)") + '"',
+      "Status: " + row.dataset.status + (row.dataset.reason ? " (" + row.dataset.reason + ")" : ""),
+      "URL: " + row.dataset.url
+    ];
+    if (row.dataset.contextBefore || row.dataset.contextAfter) {
+      lines.push(
+        "Context: …" +
+        (row.dataset.contextBefore ? row.dataset.contextBefore + " " : "") +
+        "[" + (row.dataset.linkText || "") + "]" +
+        (row.dataset.contextAfter ? " " + row.dataset.contextAfter : "") +
+        "…"
+      );
+    }
+    if (row.dataset.foundOn) lines.push("Found on: " + row.dataset.foundOn);
+    return lines.join("\n");
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    var textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    try {
+      document.execCommand("copy");
+    } catch (e) {}
+    document.body.removeChild(textarea);
+    return Promise.resolve();
+  }
+
+  function showCopiedFeedback(btn) {
+    var original = btn.textContent;
+    btn.textContent = "Copied!";
+    btn.disabled = true;
+    setTimeout(function () {
+      btn.textContent = original;
+      btn.disabled = false;
+    }, 1500);
+  }
+
   if (problemTable) {
     problemTable.addEventListener("click", function (event) {
-      var btn = event.target.closest(".mark-done-btn");
-      if (!btn) return;
-      doneIds.add(btn.dataset.linkId);
-      saveDoneIds();
-      refreshVisibility();
-      renderDoneSection();
-      updateGroupCounts();
+      var doneBtn = event.target.closest(".mark-done-btn");
+      if (doneBtn) {
+        doneIds.add(doneBtn.dataset.linkId);
+        saveDoneIds();
+        refreshVisibility();
+        renderDoneSection();
+        updateGroupCounts();
+        return;
+      }
+      var copyBtn = event.target.closest(".copy-blurb-btn");
+      if (copyBtn) {
+        var row = copyBtn.closest("tr");
+        copyText(buildInfoBlurb(row)).then(function () {
+          showCopiedFeedback(copyBtn);
+        });
+      }
     });
   }
 
