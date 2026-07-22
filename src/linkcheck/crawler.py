@@ -856,6 +856,7 @@ async def crawl_site(
     concurrency: int = CRAWL_CONCURRENCY,
     request_delay: float = CRAWL_REQUEST_DELAY_SECONDS,
     max_depth: int = CRAWL_MAX_DEPTH,
+    force: bool = False,
 ) -> list[CrawlResult]:
     """Discover course pages, then breadth-first crawl the graph of same-site pages
     they (transitively) link to - not every page WordPress happens to serve. Each
@@ -886,6 +887,11 @@ async def crawl_site(
     persisted for any page yet, so a first crawl after upgrading forces one real fetch
     per reachable page (same cost as a cold crawl) rather than trusting an empty edge
     set as "this page has no children" and wrongly pruning everything past it.
+
+    force=True skips the touch path entirely, so every reachable page gets a full
+    fetch/re-extract/sync regardless of modified_gmt - for re-applying an
+    extraction-logic change (e.g. a fixed dedup rule) to already-crawled pages without
+    waiting for their next real content edit.
 
     A course-index entry that isn't in the listing at all (deleted/renamed course)
     surfaces as a not-found CrawlResult. A *non*-course slug discovered deeper in the
@@ -938,7 +944,8 @@ async def crawl_site(
 
         known = _known_page_state(conn, site_id, slug)
         if (
-            known is not None
+            not force
+            and known is not None
             and known["modified_gmt"] is not None
             and known["modified_gmt"] == entry["modified_gmt"]
             and known["internal_links_synced_at"] is not None
@@ -959,6 +966,10 @@ async def crawl_site(
             # race, not the common "not a WP page" case; treat the same either way
             return _not_found_result(slug, kind), []
 
+        # display-only: a force=True full fetch can still land on an unchanged
+        # modified_gmt (re-applying an extraction-logic change, not a real edit) -
+        # worth surfacing even though the touch path above was skipped to get here.
+        unchanged = known is not None and known["modified_gmt"] == page.modified_gmt
         external = extract_links(page.html, page.canonical_url, site.base_url)
         internal = extract_internal_links(page.html, page.canonical_url, site.base_url)
         page_id = sync_course_page(
@@ -967,7 +978,7 @@ async def crawl_site(
         reachable_page_ids.add(page_id)
         return CrawlResult(
             slug=slug, title=page.title, url=page.canonical_url, kind=kind,
-            found=True, link_count=len(external), unchanged=False,
+            found=True, link_count=len(external), unchanged=unchanged,
         ), internal
 
     depth = 0

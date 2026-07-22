@@ -661,9 +661,11 @@ async def test_crawl_site_forces_a_refetch_for_a_page_from_before_internal_link_
     assert conn.execute("SELECT COUNT(*) AS n FROM page_links").fetchone()["n"] == 1
 
     listing = [_listing_entry("ep-math-1", "2023-01-01"), _listing_entry("odd-and-even", "2023-01-01")]
+    fetched: list[str] = []
 
     def slug_handler(request):
         slug = request.url.params["slug"]
+        fetched.append(slug)
         content = (
             '<a href="https://allinonehomeschool.com/odd-and-even/">link</a>'
             if slug == "ep-math-1" else '<a href="https://ext.example.com/x">x</a>'
@@ -673,11 +675,14 @@ async def test_crawl_site_forces_a_refetch_for_a_page_from_before_internal_link_
     async with _crawl_client(index_html=_INDEX_HTML, listing=listing, slug_handler=slug_handler) as client:
         results = await crawl_site(conn, client, _SITE)
 
-    # Both pages got a real fetch (unchanged=False) despite the listing reporting the
-    # same modified_gmt already stored, and nothing was wrongly pruned.
+    # Both pages got a real fetch despite the listing reporting the same modified_gmt
+    # already stored (so `unchanged` correctly reports True - the content really is
+    # unchanged, it just had to be re-fetched to backfill its internal-link edges), and
+    # nothing was wrongly pruned.
+    assert set(fetched) == {"ep-math-1", "odd-and-even"}
     by_slug = {r.slug: r for r in results}
-    assert by_slug["ep-math-1"].unchanged is False
-    assert by_slug["odd-and-even"].unchanged is False
+    assert by_slug["ep-math-1"].unchanged is True
+    assert by_slug["odd-and-even"].unchanged is True
     assert conn.execute("SELECT COUNT(*) AS n FROM page_links").fetchone()["n"] == 1
     assert conn.execute(
         "SELECT internal_links_synced_at FROM pages WHERE slug = 'ep-math-1'"
@@ -687,3 +692,34 @@ async def test_crawl_site_forces_a_refetch_for_a_page_from_before_internal_link_
     async with _crawl_client(index_html=_INDEX_HTML, listing=listing) as client:
         results = await crawl_site(conn, client, _SITE)
     assert all(r.unchanged for r in results)
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_force_bypasses_the_touch_path():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    seeded = CoursePage(
+        wp_id=1, slug="ep-math-1", canonical_url="https://allinonehomeschool.com/ep-math-1/",
+        title="Math 1", html="<p>x</p>", modified_gmt="2023-05-26T19:33:31",
+    )
+    sync_course_page(
+        conn, "homeschool", seeded,
+        [ExtractedLink(url="https://ext.example.com/a", text="a", day_context=None)],
+    )
+    listing = [_listing_entry("ep-math-1", "2023-05-26T19:33:31")]  # matches what's stored
+    fetched: list[str] = []
+
+    def slug_handler(request):
+        fetched.append(request.url.params["slug"])
+        # a fixed dedup rule now drops "a" as a duplicate the old extraction kept
+        return _page_response(
+            "ep-math-1", wp_id=1, title="Math 1", content="<p>no links</p>", modified_gmt="2023-05-26T19:33:31",
+        )
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing=listing, slug_handler=slug_handler) as client:
+        results = await crawl_site(conn, client, _SITE, force=True)
+
+    assert fetched == ["ep-math-1"]  # force skipped the touch path, went straight to a full fetch
+    assert results[0].unchanged is True  # still accurately reported - modified_gmt really didn't change
+    assert results[0].link_count == 0  # re-extraction actually ran and picked up the logic change
+    assert conn.execute("SELECT COUNT(*) AS n FROM page_links").fetchone()["n"] == 0
