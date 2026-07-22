@@ -916,6 +916,10 @@ async def crawl_site(
     course_slugs = set(course_by_slug)
 
     listing_map = {entry["slug"]: entry for entry in await list_all_pages(client, site)}
+    logger.info(
+        "%s: %d course pages discovered, %d pages in the site-wide listing%s",
+        site.slug, len(courses), len(listing_map), " (forcing full re-fetch)" if force else "",
+    )
 
     frontier = list(course_by_slug)  # dict preserves course-index order, already deduped by slug
     truncated = limit is not None
@@ -932,6 +936,7 @@ async def crawl_site(
     def _not_found_result(slug: str, kind: str) -> CrawlResult | None:
         if slug not in course_slugs:
             return None  # not a WP page at all - normal, not worth reporting
+        logger.warning("%s: course page %r not found (removed/renamed?)", site.slug, slug)
         course = course_by_slug[slug]
         return CrawlResult(slug=slug, title=course.title, url=course.url, kind=kind, found=False, link_count=0)
 
@@ -952,6 +957,10 @@ async def crawl_site(
         ):
             link_count, children = _touch_page_crawled(conn, known["id"])
             reachable_page_ids.add(known["id"])
+            logger.info(
+                "%s: %s [%s] unchanged, touched (%d links, %d children)",
+                site.slug, slug, kind, link_count, len(children),
+            )
             return CrawlResult(
                 slug=slug, title=None, url=entry["link"], kind=kind,
                 found=True, link_count=link_count, unchanged=True,
@@ -976,6 +985,10 @@ async def crawl_site(
             conn, site.slug, page, external, internal_links=internal, kind=kind, sort_order=sort_order
         )
         reachable_page_ids.add(page_id)
+        logger.info(
+            "%s: %s [%s] fetched (%d external links, %d internal links)%s",
+            site.slug, slug, kind, len(external), len(internal), " (unchanged content)" if unchanged else "",
+        )
         return CrawlResult(
             slug=slug, title=page.title, url=page.canonical_url, kind=kind,
             found=True, link_count=len(external), unchanged=unchanged,
@@ -994,6 +1007,10 @@ async def crawl_site(
             )
             break
         visited.update(todo)
+        logger.info(
+            "%s: BFS depth %d - processing %d pages (%d visited so far)",
+            site.slug, depth, len(todo), len(visited) - len(todo),
+        )
 
         batch = await asyncio.gather(*(_crawl_one(slug) for slug in todo))
         next_frontier: list[str] = []
@@ -1010,4 +1027,8 @@ async def crawl_site(
     if not truncated:
         _prune_unreachable_pages(conn, site_id, reachable_page_ids)
 
+    logger.info(
+        "%s: crawl finished - %d pages visited, %d reachable%s",
+        site.slug, len(visited), len(reachable_page_ids), " (truncated, pruning skipped)" if truncated else "",
+    )
     return results

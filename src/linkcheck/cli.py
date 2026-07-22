@@ -123,6 +123,15 @@ def crawl_command(db_path: str, limit: int | None, force: bool) -> None:
     """Crawl all course pages for both sites, and whatever they transitively link to
     on the same site, syncing the resulting page graph and its external links into the
     database."""
+    # Without this, crawl_site's per-page/per-BFS-level progress logging (see
+    # crawler.py) has no configured handler and is silently dropped - a long crawl (a
+    # cold one, or --force) would otherwise print nothing at all until it's completely
+    # done. httpx's own per-request INFO logging is suppressed the same way
+    # run_command already does for the check loop, so it doesn't drown this out.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
     conn = db.connect(db_path)
     db.init_db(conn)
 
