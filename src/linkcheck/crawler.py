@@ -88,11 +88,19 @@ def discover_course_urls(html: str, index_url: str, base_url: str) -> list[Cours
 
     seen: dict[str, str] = {}
     for a in content.find_all("a", href=True):
-        href = _fix_missing_slash(urljoin(index_url, a["href"].strip()))
+        raw_href = a["href"].strip()
+        try:
+            href = _fix_missing_slash(urljoin(index_url, raw_href))
+            host = urlparse(href).netloc
+        except ValueError:
+            # e.g. a stray "[" in the href makes urlsplit think it's a malformed
+            # IPv6 host literal and raise - not worth failing the whole crawl over.
+            logger.warning("Skipping malformed href %r found on index page %s", raw_href, index_url)
+            continue
         href_no_frag = href.split("#")[0].rstrip("/")
         if href_no_frag == index_no_frag:
             continue  # jump link back to the index page itself
-        if urlparse(href).netloc != base_host:
+        if host != base_host:
             continue  # sister site, or an external resource linked from the index prose
         seen.setdefault(href_no_frag, a.get_text(strip=True))
 
@@ -512,8 +520,15 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         href = (node.get("href") or "").strip()
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             continue
-        absolute = _fix_missing_slash(urljoin(page_url, href)).split("#", 1)[0]
-        if not absolute or urlparse(absolute).netloc.lower() == base_host:
+        try:
+            absolute = _fix_missing_slash(urljoin(page_url, href)).split("#", 1)[0]
+            host = urlparse(absolute).netloc.lower()
+        except ValueError:
+            # e.g. a stray "[" in the href makes urlsplit think it's a malformed
+            # IPv6 host literal and raise - not worth failing the whole crawl over.
+            logger.warning("Skipping malformed href %r found on page %s", href, page_url)
+            continue
+        if not absolute or host == base_host:
             continue
         link_text = _visible_text(node)
         if not link_text:

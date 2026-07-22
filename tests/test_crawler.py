@@ -87,6 +87,19 @@ def test_discover_dedupes_repeated_hrefs():
     assert courses[0].title == "Course A"
 
 
+def test_discover_skips_malformed_href_without_dropping_other_courses():
+    html = """
+    <div class="entry-content">
+      <a href="http://[invalid-ipv6/oops">bad link</a>
+      <a href="https://example.com/course-a/">Course A</a>
+    </div>
+    """
+    courses = discover_course_urls(
+        html, index_url="https://example.com/index/", base_url="https://example.com"
+    )
+    assert [c.url for c in courses] == ["https://example.com/course-a"]
+
+
 def test_discover_returns_empty_without_content_area():
     html = "<html><body><a href='https://example.com/x/'>x</a></body></html>"
     courses = discover_course_urls(

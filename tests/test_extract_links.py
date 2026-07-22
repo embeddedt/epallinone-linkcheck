@@ -72,6 +72,17 @@ def test_extract_links_drops_fragments_mailto_and_javascript():
     assert [link.url for link in links] == ["https://external.example.com/resource"]
 
 
+def test_extract_links_skips_malformed_href_without_dropping_other_links():
+    html = """
+    <div>
+      <a href="http://[invalid-ipv6/oops">bad link</a>
+      <a href="https://external.example.com/resource">real link</a>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert [link.url for link in links] == ["https://external.example.com/resource"]
+
+
 def test_extract_links_relative_urls_resolved_against_page_and_excluded_if_same_host():
     html = """
     <div>
