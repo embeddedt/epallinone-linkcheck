@@ -107,12 +107,12 @@ def _day_sort_key(entry: PageGroupEntry) -> tuple[int, int]:
 
 def _page_group_order_key(page: PageRef) -> tuple[int, int, int]:
     """Course groups (in course-index order) before 'other' groups, within each site -
-    course pages and 'other' pages are now crawled in the same sweep (see
-    crawler.crawl_site), so raw insertion order (pages.id) no longer tracks curriculum
-    order on its own the way it used to; page_sort_order (the course's rank in the
-    course-index listing) is the thing that actually does now. 'other' pages have no
-    such rank, so they fall back to page_order (pages.id - roughly chronological) as a
-    stable tiebreak among themselves.
+    course pages and 'other' pages (reference/day-content pages reached by BFS from a
+    course page, see crawler.crawl_site) are crawled together, so raw insertion order
+    (pages.id) no longer tracks curriculum order on its own the way it used to;
+    page_sort_order (the course's rank in the course-index listing) is the thing that
+    actually does now. 'other' pages have no such rank, so they fall back to page_order
+    (pages.id - roughly chronological) as a stable tiebreak among themselves.
     """
     if page.page_kind == "course":
         return (page.site_order, 0, page.page_sort_order if page.page_sort_order is not None else 0)
@@ -195,10 +195,10 @@ def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
     deeper for a link referenced from both a course page and an 'other' page of the
     same site.
 
-    Split by kind rather than one total per site: the whole-site sweep's 'other' pages
-    (crawler.crawl_site) can outnumber course-page links by an order of magnitude, and
-    folding them into one total would bury the course-page numbers people already
-    watch.
+    Split by kind rather than one total per site: 'other' pages (reference/day-content
+    pages reached by BFS from a course page, see crawler.crawl_site) can still
+    outnumber course-page links, and folding them into one total would bury the
+    course-page numbers people already watch.
     """
     site_slugs = [row["slug"] for row in conn.execute("SELECT slug FROM sites ORDER BY slug")]
 

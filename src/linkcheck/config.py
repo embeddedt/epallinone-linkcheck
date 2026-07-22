@@ -37,14 +37,29 @@ CRAWL_CONCURRENCY = 5
 CRAWL_REQUEST_DELAY_SECONDS = 0.2
 CRAWL_TIMEOUT_SECONDS = 20  # per-request timeout for course-index and page fetches
 
-# Page size for the whole-site listing sweep (crawler.list_all_pages) - the ceiling
+# How many link-hops deep crawl_site's BFS will follow from a course page before it
+# stops expanding the frontier, win or lose - a defensive backstop against unbounded
+# fanout from a page structure the curriculum content isn't expected to have, not a
+# value expected to actually bind. In practice the reachable graph runs to four
+# figures of pages well before ~8 hops (a shared "helpful resources" block linked from
+# every course, some courses' day content chained as separate same-site pages rather
+# than external links), so this exists purely as a runaway-fanout guard, not a tuning
+# knob for graph size.
+CRAWL_MAX_DEPTH = 8
+
+# Page size for the site-wide listing sweep (crawler.list_all_pages) - the ceiling
 # WordPress's own REST API enforces for `per_page`, not a politeness choice; a larger
-# value 400s.
+# value 400s. The sweep itself (sparse-fielded down to id/slug/link/modified_gmt) is
+# still done for the whole site, cheaply - it's what lets crawl_site's BFS skip a full
+# body fetch for a reachable page whose modified_gmt hasn't changed, and skip a wasted
+# request entirely for a same-site href that isn't a WordPress page at all (PDFs,
+# images, blog posts - see extract_internal_links). Only the *body* fetch (and
+# everything downstream: parsing, DB sync, reporting) is scoped to the reachable graph.
 CRAWL_PAGE_LIST_PER_PAGE = 100
 
 # Retry/backoff for a 429 from the site itself (a fronting CDN/WAF, not necessarily
-# WordPress) - observed in practice under the whole-site sweep's request volume
-# (thousands of pages), never under a handful of course-page fetches. A quick burst of
+# WordPress) - observed in practice under a full-site crawl's request volume
+# (hundreds of pages at once), never under a handful of course-page fetches. A quick burst of
 # 60+ concurrent requests against the live site didn't trigger it, so this is a
 # sustained-volume/longer-window threshold, not a per-request or short-burst one -
 # backed off with exponential delay rather than tuned to a specific number of

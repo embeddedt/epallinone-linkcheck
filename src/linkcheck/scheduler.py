@@ -51,12 +51,13 @@ async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
 async def crawl_loop(
     conn: sqlite3.Connection, stop_event: asyncio.Event, dashboard_path: str
 ) -> None:
-    """Recrawl every page (course and otherwise) for both sites, then wait for the
-    next cycle.
+    """Recrawl every course page for both sites, and whatever they transitively link
+    to on the same site (see crawler.crawl_site), then wait for the next cycle.
 
     Runs once immediately on startup. A shutdown request is only honored between
-    cycles, not mid-crawl - a full crawl of an unchanged site is a couple dozen
-    listing requests, so this keeps the loop simple without cancellation plumbing.
+    cycles, not mid-crawl - most of a cycle after the first is unchanged pages getting
+    touched rather than fully fetched (see crawler._touch_page_crawled), so this keeps
+    the loop simple without cancellation plumbing.
 
     Also regenerates the dashboard once a full pass finishes, same as check_loop -
     otherwise freshly-crawled data (new links, updated day labels, ...) wouldn't show

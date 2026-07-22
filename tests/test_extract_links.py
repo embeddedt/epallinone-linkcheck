@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from linkcheck.crawler import extract_links
+from linkcheck.crawler import extract_internal_links, extract_links
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -411,3 +411,80 @@ def test_extract_links_same_host_exclusion_is_case_insensitive():
     html = '<a href="https://MySite.Example.com/leaf">same site, mixed case</a>'
     links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
     assert links == []
+
+
+def test_extract_internal_links_keeps_only_same_host():
+    html = """
+    <a href="https://mysite.example.com/day-1/">internal</a>
+    <a href="https://ext.example.com/resource">external</a>
+    """
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == ["https://mysite.example.com/day-1"]
+
+
+def test_extract_internal_links_resolves_relative_urls():
+    html = '<a href="/day-1/">relative</a>'
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == ["https://mysite.example.com/day-1"]
+
+
+def test_extract_internal_links_excludes_self_link():
+    # a same-page anchor jump (fragment-only, or an absolute href that resolves back
+    # to this exact page once the fragment is stripped) is not a real edge to crawl
+    html = """
+    <a href="#top">jump</a>
+    <a href="https://mysite.example.com/course/">self, no fragment</a>
+    <a href="https://mysite.example.com/course/#section">self, with fragment</a>
+    """
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == []
+
+
+def test_extract_internal_links_drops_mailto_tel_and_javascript():
+    html = """
+    <a href="mailto:a@example.com">mail</a>
+    <a href="tel:+15551234567">tel</a>
+    <a href="javascript:void(0)">js</a>
+    """
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == []
+
+
+def test_extract_internal_links_dedupes_repeated_hrefs():
+    html = """
+    <a href="https://mysite.example.com/day-1/">first</a>
+    <a href="https://mysite.example.com/day-1/">again</a>
+    """
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == ["https://mysite.example.com/day-1"]
+
+
+def test_extract_internal_links_skips_malformed_href_without_dropping_others():
+    html = """
+    <a href="http://[invalid-ipv6/oops">bad</a>
+    <a href="https://mysite.example.com/day-1/">good</a>
+    """
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == ["https://mysite.example.com/day-1"]
+
+
+def test_extract_internal_links_same_host_check_is_case_insensitive():
+    # the host *comparison* is case-insensitive (matching extract_links); the returned
+    # URL itself is not forced to lowercase
+    html = '<a href="https://MySite.Example.com/day-1/">mixed case</a>'
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == ["https://MySite.Example.com/day-1"]

@@ -107,25 +107,21 @@ def crawl_preview_command(limit: int) -> None:
     "--limit",
     default=None,
     type=int,
-    help="Only crawl the first N course pages per site (for testing).",
+    help="Only crawl the first N course pages per site, and skip pruning pages that "
+    "dropped out of reachability (for testing) - a limited crawl doesn't walk the full "
+    "graph, so it can't tell what's actually still linked.",
 )
-@click.option(
-    "--force",
-    is_flag=True,
-    default=False,
-    help="Re-fetch and re-extract every page even if WordPress reports it unchanged "
-    "since the last crawl - use after an extraction-logic change to re-apply it to "
-    "already-crawled pages without waiting for their next real content edit.",
-)
-def crawl_command(db_path: str, limit: int | None, force: bool) -> None:
-    """Crawl all course pages for both sites and sync links into the database."""
+def crawl_command(db_path: str, limit: int | None) -> None:
+    """Crawl all course pages for both sites, and whatever they transitively link to
+    on the same site, syncing the resulting page graph and its external links into the
+    database."""
     conn = db.connect(db_path)
     db.init_db(conn)
 
     async def run() -> None:
         async with httpx.AsyncClient(timeout=CRAWL_TIMEOUT_SECONDS) as client:
             for site in SITES:
-                results = await crawler.crawl_site(conn, client, site, limit=limit, force=force)
+                results = await crawler.crawl_site(conn, client, site, limit=limit)
                 found = sum(1 for r in results if r.found)
                 course_count = sum(1 for r in results if r.kind == "course")
                 other_count = len(results) - course_count

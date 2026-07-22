@@ -17,16 +17,23 @@ CREATE TABLE IF NOT EXISTS pages (
     title TEXT,
     last_crawled_at TEXT,
     modified_gmt TEXT,                     -- WP REST API's `modified_gmt` as of last crawl;
-                                            -- lets a recrawl skip re-parsing an unchanged page
+                                            -- lets crawl_site skip a full body fetch for a
+                                            -- reachable page that hasn't changed (see
+                                            -- crawler._touch_page_crawled)
     kind TEXT NOT NULL DEFAULT 'course',   -- 'course' | 'other' - 'course' is a page
                                             -- discovered from the course-index listing;
-                                            -- 'other' is any other page the site's
-                                            -- WordPress serves (reference pages, day
-                                            -- content, answer keys, ...), found by the
-                                            -- whole-site sweep (crawler.list_all_pages)
+                                            -- 'other' is any other same-site page reached by
+                                            -- BFS from a course page (reference pages, day
+                                            -- content, answer keys, ...), see crawler.crawl_site
     sort_order INTEGER,                    -- course pages: rank in the course-index
                                             -- listing, for report display order; NULL
                                             -- for 'other' pages (see report.py)
+    internal_links_synced_at TEXT,         -- set whenever this page's page_internal_links
+                                            -- edges were actually (re)captured; NULL for a
+                                            -- page from before that table existed, which
+                                            -- forces one full re-fetch on upgrade rather than
+                                            -- trusting an unpopulated edge set (see
+                                            -- crawler._known_page_state/crawl_site)
     UNIQUE(site_id, url)
 );
 
@@ -71,6 +78,19 @@ CREATE TABLE IF NOT EXISTS page_links (
 );
 CREATE INDEX IF NOT EXISTS idx_page_links_link ON page_links(link_id);
 CREATE INDEX IF NOT EXISTS idx_page_links_page ON page_links(page_id);
+
+-- Same-site link edges (page -> the same-site pages it links to), persisted purely so
+-- crawler.crawl_site's BFS can keep expanding through an *unchanged* page (modified_gmt
+-- matches the site-wide listing sweep) without paying for a full body fetch just to
+-- rediscover its own children - see crawler._touch_page_crawled. Not used for
+-- checking/reporting (same-site links are out of scope for that - see
+-- DESIGN_EXCLUSIONS in config.py), so no metadata beyond the edge itself; fully
+-- replaced (delete + reinsert) on every real crawl of the page rather than diffed.
+CREATE TABLE IF NOT EXISTS page_internal_links (
+    page_id INTEGER NOT NULL REFERENCES pages(id),
+    child_url TEXT NOT NULL,
+    PRIMARY KEY (page_id, child_url)
+);
 
 CREATE TABLE IF NOT EXISTS link_checks (
     id INTEGER PRIMARY KEY,

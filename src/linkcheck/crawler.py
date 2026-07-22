@@ -20,6 +20,7 @@ from bs4.element import Tag
 
 from linkcheck.config import (
     CRAWL_CONCURRENCY,
+    CRAWL_MAX_DEPTH,
     CRAWL_PAGE_LIST_PER_PAGE,
     CRAWL_RATE_LIMIT_BASE_DELAY_SECONDS,
     CRAWL_RATE_LIMIT_MAX_RETRIES,
@@ -132,8 +133,8 @@ async def _get_with_retry(
     client: httpx.AsyncClient, url: str, *, params: dict | None = None, follow_redirects: bool = False
 ) -> httpx.Response:
     """GET with bounded retry/backoff on a 429 - seen in practice from the site itself
-    (a fronting CDN/WAF, not necessarily WordPress) under the whole-site sweep's
-    request volume, never under a handful of course-page fetches. Honors Retry-After
+    (a fronting CDN/WAF, not necessarily WordPress) under a full-site crawl's request
+    volume, never under a handful of course-page fetches. Honors Retry-After
     when the response sends one; falls back to exponential backoff with jitter
     otherwise, since it may not.
     """
@@ -210,9 +211,10 @@ async def _fetch_wp_page(
     return results[0]
 
 
-# Sparse fieldset for the whole-site listing sweep (list_all_pages) - enough to tell
-# what exists and whether it changed, without paying for the full rendered body of
-# every page on the site.
+# Sparse fieldset for the site-wide listing sweep (list_all_pages) - enough to tell
+# what exists and whether it's changed, without paying for the full rendered body of
+# every page on the site; crawl_site's BFS only pays for a full fetch of a page it's
+# actually reachable and changed (or never-before-seen).
 PAGE_LIST_FIELDS = "id,slug,link,modified_gmt"
 
 
@@ -223,7 +225,8 @@ async def list_all_pages(
     WordPress serves under the 'pages' post type - via the REST API's paginated pages
     collection, sparse-fielded down to id/slug/link/modified_gmt.
 
-    This is what makes a per-page modified_gmt check affordable at thousands-of-pages
+    This is what makes crawl_site's per-page modified_gmt check (and its "is this
+    same-site href even a WordPress page" check) affordable at thousands-of-pages
     scale: one request per ~100 pages gets existence *and* modified_gmt for the whole
     site, instead of one request per page. `page` past the last one 400s
     (`rest_post_invalid_page_number`) rather than returning an empty list, so the loop
@@ -549,6 +552,50 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     return list(seen.values())
 
 
+def extract_internal_links(html: str, page_url: str, site_base_url: str) -> list[str]:
+    """Pull every same-host link out of a page's rendered body, for crawl_site's BFS
+    over the course-linked page graph - the mirror image of extract_links, which keeps
+    only the opposite (different-host) half of the same `<a href>` set and is what
+    actually gets checked/reported on.
+
+    A same-page anchor jump back to this exact page (fragment-only, or an absolute href
+    that resolves to this same URL once the fragment is stripped) is excluded rather
+    than treated as a trivial self-edge - same reasoning as discover_course_urls
+    excluding the course index's own jump links back to itself.
+
+    Not every same-host href discovered here resolves to a WordPress "page" the BFS can
+    actually crawl (same-site PDFs/images, blog posts, category archives, ...) - that's
+    sorted out downstream by fetch_page_by_slug returning None for a slug the pages
+    REST endpoint doesn't recognize, which simply stops that branch of the traversal
+    rather than being treated as a broken link (same-site links are out of scope for
+    checking/reporting entirely - see DESIGN_EXCLUSIONS in config.py).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    base_host = urlparse(site_base_url).netloc.lower()
+    page_no_frag = page_url.split("#", 1)[0].rstrip("/")
+
+    seen: dict[str, None] = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        try:
+            absolute = _fix_missing_slash(urljoin(page_url, href))
+            host = urlparse(absolute).netloc.lower()
+        except ValueError:
+            # e.g. a stray "[" in the href makes urlsplit think it's a malformed
+            # IPv6 host literal and raise - not worth failing the whole crawl over.
+            logger.warning("Skipping malformed href %r found on page %s", href, page_url)
+            continue
+        if host != base_host:
+            continue
+        href_no_frag = absolute.split("#", 1)[0].rstrip("/")
+        if not href_no_frag or href_no_frag == page_no_frag:
+            continue
+        seen.setdefault(href_no_frag, None)
+    return list(seen)
+
+
 def _now() -> str:
     return datetime.now(UTC).isoformat()
 
@@ -568,19 +615,27 @@ def _upsert_page(
     every cycle, so this is what lets a page correctly flip between 'course' and
     'other' if the course index itself changes, rather than trusting a stale value
     forever.
+
+    Only ever called from sync_course_page's full-sync path, which always rewrites
+    this page's page_internal_links right after - so setting internal_links_synced_at
+    here is accurate: it marks "this page's internal-link edges reflect its current
+    content," not just "this page exists." See _known_page_state/crawl_site for why
+    that distinction matters.
     """
     now = _now()
     row = conn.execute(
         """
-        INSERT INTO pages (site_id, url, slug, title, last_crawled_at, modified_gmt, kind, sort_order)
-        VALUES (:site_id, :url, :slug, :title, :now, :modified_gmt, :kind, :sort_order)
+        INSERT INTO pages
+            (site_id, url, slug, title, last_crawled_at, modified_gmt, kind, sort_order, internal_links_synced_at)
+        VALUES (:site_id, :url, :slug, :title, :now, :modified_gmt, :kind, :sort_order, :now)
         ON CONFLICT(site_id, url) DO UPDATE SET
             slug = excluded.slug,
             title = excluded.title,
             last_crawled_at = excluded.last_crawled_at,
             modified_gmt = excluded.modified_gmt,
             kind = excluded.kind,
-            sort_order = excluded.sort_order
+            sort_order = excluded.sort_order,
+            internal_links_synced_at = excluded.internal_links_synced_at
         RETURNING id
         """,
         {
@@ -598,27 +653,43 @@ def _upsert_page(
 
 
 def _known_page_state(conn: sqlite3.Connection, site_id: int, slug: str) -> sqlite3.Row | None:
-    """Look up a previously crawled page's id and modified_gmt by (site, slug) - the
-    stable join key across a recrawl, since a page's URL path can differ from the
-    course-index link that discovered it (see fetch_course_page's docstring).
+    """Look up a previously crawled page's id/modified_gmt/internal_links_synced_at by
+    (site, slug) - the stable join key across a recrawl, since a page's URL path can
+    differ from the course-index link that discovered it (see fetch_course_page's
+    docstring).
+
+    internal_links_synced_at is NULL for a page synced before page_internal_links
+    existed (a DB carried over from before crawl_site became a graph crawl) - crawl_site
+    must not treat such a page as safe to just touch on an "unchanged" modified_gmt,
+    since its persisted internal-link edges (there are none) would understate its real
+    children and wrongly prune whatever it actually still links to.
     """
     return conn.execute(
-        "SELECT id, modified_gmt FROM pages WHERE site_id = ? AND slug = ?",
+        "SELECT id, modified_gmt, internal_links_synced_at FROM pages WHERE site_id = ? AND slug = ?",
         (site_id, slug),
     ).fetchone()
 
 
-def _touch_page_crawled(conn: sqlite3.Connection, page_id: int) -> int:
-    """Record that a page was recrawled and found unchanged, without re-parsing or
-    diffing its links. Returns its current link count for the crawl summary.
+def _touch_page_crawled(conn: sqlite3.Connection, page_id: int) -> tuple[int, list[str]]:
+    """Record that a page was recrawled and found unchanged (its modified_gmt matched
+    the site-wide listing sweep), without a full fetch or reparse. Returns its current
+    external-link count for the crawl summary, and the internal-link edges persisted
+    from its last real crawl (see sync_course_page) - what lets crawl_site's BFS keep
+    expanding through an unchanged page without paying for its body.
     """
     now = _now()
     with conn:
         conn.execute("UPDATE pages SET last_crawled_at = ? WHERE id = ?", (now, page_id))
-        row = conn.execute(
+        link_count = conn.execute(
             "SELECT COUNT(*) AS n FROM page_links WHERE page_id = ?", (page_id,)
-        ).fetchone()
-    return row["n"]
+        ).fetchone()["n"]
+        children = [
+            row["child_url"]
+            for row in conn.execute(
+                "SELECT child_url FROM page_internal_links WHERE page_id = ?", (page_id,)
+            )
+        ]
+    return link_count, children
 
 
 def _upsert_link(conn: sqlite3.Connection, url: str) -> int:
@@ -648,11 +719,12 @@ def sync_course_page(
     page: CoursePage,
     links: list[ExtractedLink],
     *,
+    internal_links: list[str] = (),
     kind: str = "course",
     sort_order: int | None = None,
-) -> None:
-    """Upsert a crawled page (course or otherwise, see pages.kind) and its links, and
-    drop stale associations.
+) -> int:
+    """Upsert a crawled page (course or otherwise, see pages.kind) and its links, drop
+    stale associations, and return the page's id.
 
     Runs as one transaction: the page row, every link found on this crawl, and the
     page<->link associations are all upserted, then any `page_links` row for an
@@ -664,12 +736,26 @@ def sync_course_page(
     Links themselves are never hard-deleted here, even if a link ends up with zero
     remaining `page_links` rows after this.
     An orphaned link simply stops being selected by the check phase, since
-    that query joins through `page_links`.
+    that query joins through `page_links`. The returned page id is how crawl_site's BFS
+    tracks which pages are still reachable this cycle, for the same treatment one level
+    up (see _prune_unreachable_pages).
+
+    internal_links (same-site hrefs, see extract_internal_links) are persisted
+    separately in page_internal_links, replaced wholesale rather than diffed like
+    page_links - they carry no metadata worth preserving, and exist purely so a later
+    crawl can resume BFS traversal through this page without fetching it again if it
+    turns out to be unchanged (see _touch_page_crawled).
     """
     site_id = _get_site_id(conn, site_slug)
     now = _now()
     with conn:
         page_id = _upsert_page(conn, site_id, page, kind=kind, sort_order=sort_order)
+
+        conn.execute("DELETE FROM page_internal_links WHERE page_id = ?", (page_id,))
+        conn.executemany(
+            "INSERT INTO page_internal_links (page_id, child_url) VALUES (?, ?)",
+            [(page_id, url) for url in internal_links],
+        )
 
         current_occurrences: set[tuple[int, str]] = set()
         for link in links:
@@ -714,16 +800,19 @@ def sync_course_page(
             placeholders = ",".join("?" * len(stale_ids))
             conn.execute(f"DELETE FROM page_links WHERE id IN ({placeholders})", stale_ids)
 
+    return page_id
+
 
 @dataclass(frozen=True)
 class CrawlResult:
     slug: str
-    title: str | None  # None for an 'unchanged' result - not worth a fetch just to report it
+    title: str | None
     url: str
     kind: str  # 'course' | 'other', see pages.kind
     found: bool
     link_count: int
-    unchanged: bool = False  # modified_gmt matched the stored value - full body/parse skipped
+    unchanged: bool = False  # modified_gmt matched the site-wide listing sweep - full
+                             # body fetch/reparse was skipped (see _touch_page_crawled)
 
 
 def _course_order(courses: list[CourseLink]) -> dict[str, int]:
@@ -734,6 +823,30 @@ def _course_order(courses: list[CourseLink]) -> dict[str, int]:
     return {_slug_from_url(course.url): i for i, course in enumerate(courses)}
 
 
+def _prune_unreachable_pages(conn: sqlite3.Connection, site_id: int, reachable_page_ids: set[int]) -> None:
+    """Drop `page_links` rows for any page belonging to this site that this cycle's BFS
+    didn't reach (a course delisted, an internal link removed) - the same "kept, not
+    hard-deleted, just stops being checked/reported" treatment sync_course_page already
+    gives an individual orphaned link, applied one level up: both the check phase and
+    report queries join through `page_links`, so a page with none left contributes
+    nothing to either, exactly like an orphaned link. The `pages` row itself is left
+    alone so a later recrawl that re-links it resyncs cleanly, as if freshly discovered.
+
+    Only call this after a *complete* BFS - see crawl_site's `truncated` guard. A
+    --limit'd or max_depth-cutoff crawl's unvisited-page set says nothing about what's
+    actually still reachable and would wrongly prune pages nothing has really dropped.
+    """
+    with conn:
+        stale_ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM pages WHERE site_id = ?", (site_id,))
+            if row["id"] not in reachable_page_ids
+        ]
+        if stale_ids:
+            placeholders = ",".join("?" * len(stale_ids))
+            conn.execute(f"DELETE FROM page_links WHERE page_id IN ({placeholders})", stale_ids)
+
+
 async def crawl_site(
     conn: sqlite3.Connection,
     client: httpx.AsyncClient,
@@ -742,86 +855,148 @@ async def crawl_site(
     limit: int | None = None,
     concurrency: int = CRAWL_CONCURRENCY,
     request_delay: float = CRAWL_REQUEST_DELAY_SECONDS,
-    force: bool = False,
+    max_depth: int = CRAWL_MAX_DEPTH,
 ) -> list[CrawlResult]:
-    """Discover, fetch, extract, and sync every page on the site in one pass - course
-    pages *and* everything else the site's WordPress serves under the 'pages' post
-    type (kind='other' - reference/day-content pages a course page links to
-    internally, and anything else, checked exactly the same way as a course page).
+    """Discover course pages, then breadth-first crawl the graph of same-site pages
+    they (transitively) link to - not every page WordPress happens to serve. Each
+    level of the BFS is one batch of concurrent page fetches; the internal links found
+    on a level become the next level's frontier, so a course's day-content pages get
+    pulled in, and whatever *those* link to, and so on, until the frontier runs dry or
+    max_depth is hit.
 
-    Course identity/order comes from the course-index page (discover_courses_for_site);
-    which pages currently exist, and whether each one has changed, comes from one
-    paginated sweep of the WP REST API's whole pages collection (list_all_pages) - a
-    course page is just a page whose slug also happens to appear in that listing, kept
-    in sync exactly the same way as any other page. A course-index entry whose slug
-    doesn't show up in the listing at all (deleted/renamed course) still surfaces as a
-    not-found result, same as before this covered the whole site - list_all_pages
-    already tells us the full set of slugs that currently exist, so no extra request
-    is needed to notice.
+    Course identity/order comes from the course-index page (discover_courses_for_site)
+    and seeds depth 0 of the BFS; kind='course' vs 'other' is purely "is this slug in
+    the course index," independent of how the BFS reached it - a course page linked
+    directly from another course page is still kind='course', not 'other'.
 
-    Bounded by a semaphore rather than fetching everything at once - out of
-    politeness to the site being crawled. Calling the synchronous sync_course_page()
-    from these concurrent coroutines needs no lock - see the shared-connection note in
+    A cheap site-wide listing sweep (list_all_pages) runs once up front - not to widen
+    the crawl back out to the whole site, but as a lookup table the BFS uses twice:
+    (1) a same-site href discovered mid-graph that isn't in the listing definitely
+    isn't a WordPress page at all (a PDF, an image, a blog post - see
+    extract_internal_links) and can be dropped with zero extra requests, instead of
+    spending one to find that out; (2) a page whose modified_gmt in the listing matches
+    what's already stored gets touched (_touch_page_crawled) rather than fully
+    fetched - reusing the internal-link edges persisted from its last real crawl (see
+    sync_course_page) to keep the BFS expanding through it without paying for its body.
+    Only a reachable page that's new or actually changed gets a full fetch; everything
+    downstream of that (parsing, DB sync, checking, reporting) stays scoped to the
+    reachable graph, same as before this listing sweep was reintroduced. The touch path
+    additionally requires internal_links_synced_at to be set (see _known_page_state) -
+    a DB carried over from before crawl_site tracked internal-link edges has none
+    persisted for any page yet, so a first crawl after upgrading forces one real fetch
+    per reachable page (same cost as a cold crawl) rather than trusting an empty edge
+    set as "this page has no children" and wrongly pruning everything past it.
+
+    A course-index entry that isn't in the listing at all (deleted/renamed course)
+    surfaces as a not-found CrawlResult. A *non*-course slug discovered deeper in the
+    graph that isn't in the listing is not flagged the same way - it's simply dropped,
+    since that's the normal case for a same-site href, not a broken one.
+
+    A page previously reachable that no longer shows up in this cycle's BFS (a course
+    delisted, an internal link removed elsewhere) is pruned via
+    _prune_unreachable_pages once the traversal finishes, but only if it ran to
+    completion - a `limit` or a max_depth cutoff means large parts of the real graph
+    were never visited, so pruning is skipped rather than wrongly treating "not visited
+    this run" as "no longer linked."
+
+    Bounded by a semaphore rather than fetching everything at once - out of politeness
+    to the site being crawled. Calling the synchronous sync_course_page() from these
+    concurrent coroutines needs no lock - see the shared-connection note in
     scheduler.py for why.
-
-    force=True skips the modified_gmt cheap-check below so every page gets a full
-    fetch/re-extract/sync regardless of whether WordPress reports it as changed - for
-    re-applying an extraction-logic change (e.g. a fixed dedup rule) to already-crawled
-    pages without waiting for their next real content edit.
     """
     courses = await discover_courses_for_site(client, site)
     course_order = _course_order(courses)
+    course_by_slug = {_slug_from_url(course.url): course for course in courses}
+    course_slugs = set(course_by_slug)
 
-    listing = await list_all_pages(client, site)
-    # Courses first, in curriculum order, then everything else in whatever order the
-    # REST API returned it (sort is stable) - so a small --limit, used for quick manual
-    # sanity checks, still exercises course pages rather than an arbitrary slice of
-    # "other" pages.
-    listing.sort(key=lambda entry: course_order.get(entry["slug"], len(course_order)))
-    listing_slugs = {entry["slug"] for entry in listing}  # full set, before any --limit truncation
+    listing_map = {entry["slug"]: entry for entry in await list_all_pages(client, site)}
+
+    frontier = list(course_by_slug)  # dict preserves course-index order, already deduped by slug
+    truncated = limit is not None
     if limit is not None:
-        listing = listing[:limit]
+        frontier = frontier[:limit]
 
     site_id = _get_site_id(conn, site.slug)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _crawl_one(entry: dict) -> CrawlResult:
-        slug = entry["slug"]
+    visited: set[str] = set()
+    reachable_page_ids: set[int] = set()
+    results: list[CrawlResult] = []
+
+    def _not_found_result(slug: str, kind: str) -> CrawlResult | None:
+        if slug not in course_slugs:
+            return None  # not a WP page at all - normal, not worth reporting
+        course = course_by_slug[slug]
+        return CrawlResult(slug=slug, title=course.title, url=course.url, kind=kind, found=False, link_count=0)
+
+    async def _crawl_one(slug: str) -> tuple[CrawlResult | None, list[str]]:
         kind = "course" if slug in course_order else "other"
         sort_order = course_order.get(slug)
+        entry = listing_map.get(slug)
+        if entry is None:
+            return _not_found_result(slug, kind), []
+
         known = _known_page_state(conn, site_id, slug)
+        if (
+            known is not None
+            and known["modified_gmt"] is not None
+            and known["modified_gmt"] == entry["modified_gmt"]
+            and known["internal_links_synced_at"] is not None
+        ):
+            link_count, children = _touch_page_crawled(conn, known["id"])
+            reachable_page_ids.add(known["id"])
+            return CrawlResult(
+                slug=slug, title=None, url=entry["link"], kind=kind,
+                found=True, link_count=link_count, unchanged=True,
+            ), children
 
         async with semaphore:
-            # modified_gmt already came from the listing sweep above, at no extra
-            # request cost - most pages don't change day to day, so this skips the
-            # full body fetch and link re-extraction for the common case.
-            if (
-                not force
-                and known is not None
-                and known["modified_gmt"] is not None
-                and entry["modified_gmt"] == known["modified_gmt"]
-            ):
-                link_count = _touch_page_crawled(conn, known["id"])
-                return CrawlResult(
-                    slug=slug, title=None, url=entry["link"], kind=kind,
-                    found=True, link_count=link_count, unchanged=True,
-                )
-
             page = await fetch_page_by_slug(client, site, slug)
             await asyncio.sleep(request_delay)
+
         if page is None:
-            return CrawlResult(slug=slug, title=None, url=entry["link"], kind=kind, found=False, link_count=0)
-        links = extract_links(page.html, page.canonical_url, site.base_url)
-        sync_course_page(conn, site.slug, page, links, kind=kind, sort_order=sort_order)
+            # the listing said it existed a moment ago - a narrow delete-in-between
+            # race, not the common "not a WP page" case; treat the same either way
+            return _not_found_result(slug, kind), []
+
+        external = extract_links(page.html, page.canonical_url, site.base_url)
+        internal = extract_internal_links(page.html, page.canonical_url, site.base_url)
+        page_id = sync_course_page(
+            conn, site.slug, page, external, internal_links=internal, kind=kind, sort_order=sort_order
+        )
+        reachable_page_ids.add(page_id)
         return CrawlResult(
             slug=slug, title=page.title, url=page.canonical_url, kind=kind,
-            found=True, link_count=len(links),
-        )
+            found=True, link_count=len(external), unchanged=False,
+        ), internal
 
-    results = list(await asyncio.gather(*(_crawl_one(entry) for entry in listing)))
-    results.extend(
-        CrawlResult(slug=slug, title=course.title, url=course.url, kind="course", found=False, link_count=0)
-        for course in courses
-        if (slug := _slug_from_url(course.url)) not in listing_slugs
-    )
+    depth = 0
+    while frontier:
+        todo = [slug for slug in dict.fromkeys(frontier) if slug not in visited]
+        if not todo:
+            break
+        if depth > max_depth:
+            truncated = True
+            logger.warning(
+                "%s: BFS hit max_depth=%d with %d slugs still queued - stopping early: %s",
+                site.slug, max_depth, len(todo), todo[:10],
+            )
+            break
+        visited.update(todo)
+
+        batch = await asyncio.gather(*(_crawl_one(slug) for slug in todo))
+        next_frontier: list[str] = []
+        for result, internal_urls in batch:
+            if result is not None:
+                results.append(result)
+            for href in internal_urls:
+                child_slug = _slug_from_url(href)
+                if child_slug not in visited:
+                    next_frontier.append(child_slug)
+        frontier = next_frontier
+        depth += 1
+
+    if not truncated:
+        _prune_unreachable_pages(conn, site_id, reachable_page_ids)
+
     return results

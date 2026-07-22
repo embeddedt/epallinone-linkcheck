@@ -34,6 +34,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "pages", "modified_gmt", "TEXT")
     _add_column_if_missing(conn, "pages", "kind", "TEXT NOT NULL DEFAULT 'course'")
     _add_column_if_missing(conn, "pages", "sort_order", "INTEGER")
+    # Left NULL (not backfilled) on purpose - a page from before crawl_site tracked
+    # internal-link edges has none recorded, so it must be treated as "not yet synced
+    # under this scheme" and get one real recrawl rather than being trusted as having
+    # zero children. See crawler._known_page_state/crawl_site.
+    _add_column_if_missing(conn, "pages", "internal_links_synced_at", "TEXT")
     _migrate_page_links_occurrences(conn, schema)
     _sync_sites(conn)
     conn.commit()
