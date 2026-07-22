@@ -16,9 +16,9 @@ def conn():
     connection.close()
 
 
-def _sync(conn, site_slug, slug, url, links):
+def _sync(conn, site_slug, slug, url, links, *, kind="course", sort_order=None):
     page = CoursePage(wp_id=1, slug=slug, canonical_url=url, title=slug.replace("-", " ").title(), html="")
-    sync_course_page(conn, site_slug, page, links)
+    sync_course_page(conn, site_slug, page, links, kind=kind, sort_order=sort_order)
 
 
 def _check_all_due(conn, result: CheckResult, now: datetime | None = None):
@@ -45,10 +45,31 @@ def test_get_site_summaries_counts_by_status(conn):
     )
     _confirm_broken(conn)
 
-    summaries = {s.slug: s for s in report.get_site_summaries(conn)}
-    assert summaries["homeschool"].broken == 1
-    assert summaries["homeschool"].total == 1
-    assert summaries["highschool"].total == 0  # site with no crawled pages yet
+    summaries = {(s.slug, s.kind): s for s in report.get_site_summaries(conn)}
+    assert summaries[("homeschool", "course")].broken == 1
+    assert summaries[("homeschool", "course")].total == 1
+    assert summaries[("highschool", "course")].total == 0  # site with no crawled pages yet
+    assert summaries[("homeschool", "other")].total == 0  # no 'other' pages crawled yet
+
+
+def test_get_site_summaries_splits_course_and_other(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/course-broken", text="a", day_context=None)],
+        kind="course", sort_order=0,
+    )
+    _sync(
+        conn, "homeschool", "odd-and-even", "https://allinonehomeschool.com/odd-and-even/",
+        [ExtractedLink(url="https://ext.example.com/other-broken", text="b", day_context=None)],
+        kind="other",
+    )
+    _confirm_broken(conn)
+
+    summaries = {(s.slug, s.kind): s for s in report.get_site_summaries(conn)}
+    assert summaries[("homeschool", "course")].broken == 1
+    assert summaries[("homeschool", "course")].total == 1
+    assert summaries[("homeschool", "other")].broken == 1
+    assert summaries[("homeschool", "other")].total == 1
 
 
 def test_get_problem_links_excludes_ok_and_pending(conn):
@@ -163,9 +184,9 @@ def test_get_problem_links_excludes_source_citation_links(conn, text):
     _confirm_broken(conn)
 
     assert report.get_problem_links(conn) == []
-    summaries = {s.slug: s for s in report.get_site_summaries(conn)}
-    assert summaries["homeschool"].broken == 0
-    assert summaries["homeschool"].total == 0
+    summaries = {(s.slug, s.kind): s for s in report.get_site_summaries(conn)}
+    assert summaries[("homeschool", "course")].broken == 0
+    assert summaries[("homeschool", "course")].total == 0
 
 
 def test_get_problem_links_keeps_source_text_link_if_used_as_a_real_link_elsewhere(conn):
@@ -206,9 +227,9 @@ def test_get_site_summaries_watching_count(conn):
     )
     _check_all_due(conn, CheckResult(404, None, 10))
 
-    summaries = {s.slug: s for s in report.get_site_summaries(conn)}
-    assert summaries["homeschool"].watching == 1
-    assert summaries["homeschool"].pending == 1  # still counted under its real status too
+    summaries = {(s.slug, s.kind): s for s in report.get_site_summaries(conn)}
+    assert summaries[("homeschool", "course")].watching == 1
+    assert summaries[("homeschool", "course")].pending == 1  # still counted under its real status too
 
 
 def test_get_check_progress_counts_checked_vs_total(conn):
@@ -305,6 +326,39 @@ def test_render_html_report_contains_expected_content(conn):
     assert "Math 1" in html
 
 
+def test_render_html_report_separates_other_pages_section(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/course-broken", text="a", day_context=None)],
+        kind="course", sort_order=0,
+    )
+    _sync(
+        conn, "homeschool", "odd-and-even", "https://allinonehomeschool.com/odd-and-even/",
+        [ExtractedLink(url="https://ext.example.com/other-broken", text="b", day_context=None)],
+        kind="other",
+    )
+    _confirm_broken(conn)
+
+    html = report.render_html_report(report.get_problem_links(conn), report.get_watch_links(conn))
+    assert "Other pages" in html
+    assert "Math 1" in html
+    assert "Odd And Even" in html
+    # course group renders before the "Other pages" divider, which renders before the
+    # 'other' group
+    assert html.index("Math 1") < html.index("Other pages") < html.index("Odd And Even")
+
+
+def test_render_html_report_no_other_pages_divider_when_all_course(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/broken", text="a", day_context=None)],
+    )
+    _confirm_broken(conn)
+
+    html = report.render_html_report(report.get_problem_links(conn), report.get_watch_links(conn))
+    assert "Other pages" not in html
+
+
 def test_dashboard_shows_blacklist_configuration():
     html = report.render_html_report([], [])
     assert "Never-checked hosts" in html
@@ -351,6 +405,7 @@ _GROUP = report.PageGroup(
     page_title="Chemistry",
     page_url="https://allinonehighschool.com/chemistry/",
     last_crawled_at=None,
+    kind="course",
     entries=[],
 )
 

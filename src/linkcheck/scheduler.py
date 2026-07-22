@@ -51,11 +51,12 @@ async def _sleep_or_stop(stop_event: asyncio.Event, seconds: float) -> None:
 async def crawl_loop(
     conn: sqlite3.Connection, stop_event: asyncio.Event, dashboard_path: str
 ) -> None:
-    """Recrawl all course pages for both sites, then wait for the next cycle.
+    """Recrawl every page (course and otherwise) for both sites, then wait for the
+    next cycle.
 
     Runs once immediately on startup. A shutdown request is only honored between
-    cycles, not mid-crawl - a full crawl is on the order of a hundred course-page
-    fetches, so this keeps the loop simple without cancellation plumbing.
+    cycles, not mid-crawl - a full crawl of an unchanged site is a couple dozen
+    listing requests, so this keeps the loop simple without cancellation plumbing.
 
     Also regenerates the dashboard once a full pass finishes, same as check_loop -
     otherwise freshly-crawled data (new links, updated day labels, ...) wouldn't show
@@ -75,7 +76,7 @@ async def crawl_loop(
                     logger.exception("Crawl failed for site %s", site.slug)
                     continue
                 found = sum(1 for r in results if r.found)
-                logger.info("%s: crawled %d/%d course pages", site.slug, found, len(results))
+                logger.info("%s: crawled %d/%d pages", site.slug, found, len(results))
             try:
                 _write_dashboard(conn, dashboard_path)
             except Exception:

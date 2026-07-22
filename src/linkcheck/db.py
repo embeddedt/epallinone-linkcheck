@@ -32,6 +32,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "page_links", "context_after", "TEXT")
     _add_column_if_missing(conn, "page_links", "day_label", "TEXT")
     _add_column_if_missing(conn, "pages", "modified_gmt", "TEXT")
+    _add_column_if_missing(conn, "pages", "kind", "TEXT NOT NULL DEFAULT 'course'")
+    _add_column_if_missing(conn, "pages", "sort_order", "INTEGER")
     _migrate_page_links_occurrences(conn, schema)
     _sync_sites(conn)
     conn.commit()

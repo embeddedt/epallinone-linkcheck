@@ -127,13 +127,19 @@ def crawl_command(db_path: str, limit: int | None, force: bool) -> None:
             for site in SITES:
                 results = await crawler.crawl_site(conn, client, site, limit=limit, force=force)
                 found = sum(1 for r in results if r.found)
-                click.echo(f"{site.slug}: crawled {found}/{len(results)} course pages")
+                course_count = sum(1 for r in results if r.kind == "course")
+                other_count = len(results) - course_count
+                click.echo(
+                    f"{site.slug}: crawled {found}/{len(results)} pages "
+                    f"({course_count} course, {other_count} other)"
+                )
                 for result in results:
+                    label = result.title or result.slug
                     if not result.found:
-                        click.echo(f"  SKIP (not found): {result.course.title!r} -> {result.course.url}")
+                        click.echo(f"  SKIP (not found): {label!r} -> {result.url}")
                         continue
                     suffix = " (unchanged)" if result.unchanged else ""
-                    click.echo(f"  {result.course.title!r}: {result.link_count} external links synced{suffix}")
+                    click.echo(f"  [{result.kind}] {label!r}: {result.link_count} external links synced{suffix}")
 
     try:
         asyncio.run(run())

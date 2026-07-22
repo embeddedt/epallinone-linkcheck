@@ -49,6 +49,8 @@ class PageRef:
     page_url: str
     page_order: int
     page_last_crawled_at: str | None
+    page_kind: str  # 'course' | 'other', see schema.sql pages.kind
+    page_sort_order: int | None  # course pages: rank in the course-index listing; None for 'other'
     day_context: str  # '' when the link has no day section (see schema.sql page_links)
     day_number: int | None
     day_label: str | None
@@ -89,6 +91,7 @@ class PageGroup:
     page_title: str
     page_url: str
     last_crawled_at: str | None
+    kind: str  # 'course' | 'other', see schema.sql pages.kind
     entries: list[PageGroupEntry]
 
 
@@ -102,17 +105,31 @@ def _day_sort_key(entry: PageGroupEntry) -> tuple[int, int]:
     return (1, 0)
 
 
+def _page_group_order_key(page: PageRef) -> tuple[int, int, int]:
+    """Course groups (in course-index order) before 'other' groups, within each site -
+    course pages and 'other' pages are now crawled in the same sweep (see
+    crawler.crawl_site), so raw insertion order (pages.id) no longer tracks curriculum
+    order on its own the way it used to; page_sort_order (the course's rank in the
+    course-index listing) is the thing that actually does now. 'other' pages have no
+    such rank, so they fall back to page_order (pages.id - roughly chronological) as a
+    stable tiebreak among themselves.
+    """
+    if page.page_kind == "course":
+        return (page.site_order, 0, page.page_sort_order if page.page_sort_order is not None else 0)
+    return (page.site_order, 1, page.page_order)
+
+
 def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
     """Flatten each link's page references into (page, link) pairs and group by page,
-    so the dashboard can render one table per course page instead of cramming every
-    page a link appears on into a single "Found on" column. A link referenced from
-    multiple pages lands in each page's group - same reasoning as get_site_summaries:
-    it's a real risk from every page it's linked from.
+    so the dashboard can render one table per page instead of cramming every page a
+    link appears on into a single "Found on" column. A link referenced from multiple
+    pages lands in each page's group - same reasoning as get_site_summaries: it's a
+    real risk from every page it's linked from.
 
-    Groups are ordered by site then by course/page discovery order (sites.id, pages.id
-    - insertion order, which follows config.SITES and the course index listing) rather
-    than alphabetically, so e.g. all homeschool courses come before all highschool ones
-    and courses appear in their natural listing order rather than sorted by title.
+    Groups are ordered by site, then course groups before 'other' groups, then by
+    course/page discovery order within each (see _page_group_order_key) - so e.g. all
+    homeschool groups come before all highschool ones, and within a site, courses
+    appear in their natural listing order before any 'other' pages.
 
     Entries within a group come from many different links' query results and land in
     the shared per-page bucket in whichever order those links were iterated in (by
@@ -120,13 +137,15 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
     number here; no single query's ORDER BY can produce it.
     """
     groups: dict[tuple[str, str, str], list[PageGroupEntry]] = {}
-    order_keys: dict[tuple[str, str, str], tuple[int, int]] = {}
+    order_keys: dict[tuple[str, str, str], tuple[int, int, int]] = {}
     last_crawled_ats: dict[tuple[str, str, str], str | None] = {}
+    kinds: dict[tuple[str, str, str], str] = {}
     for link in links:
         for page in link.pages:
             key = (page.site_slug, page.page_title, page.page_url)
-            order_keys[key] = (page.site_order, page.page_order)
+            order_keys[key] = _page_group_order_key(page)
             last_crawled_ats[key] = page.page_last_crawled_at
+            kinds[key] = page.page_kind
             groups.setdefault(key, []).append(
                 PageGroupEntry(
                     link=link,
@@ -144,6 +163,7 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
             page_title=title,
             page_url=url,
             last_crawled_at=last_crawled_ats[(slug, title, url)],
+            kind=kinds[(slug, title, url)],
             entries=sorted(entries, key=_day_sort_key),
         )
         for (slug, title, url), entries in sorted(
@@ -152,9 +172,13 @@ def _group_by_page(links: list[LinkReportRow]) -> list[PageGroup]:
     ]
 
 
+PAGE_KINDS = ("course", "other")
+
+
 @dataclass(frozen=True)
 class SiteSummary:
     slug: str
+    kind: str  # 'course' | 'other', see schema.sql pages.kind
     ok: int
     broken: int
     unreachable: int
@@ -164,22 +188,29 @@ class SiteSummary:
 
 
 def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
-    """Per-site link counts by status, plus a separate "watching" count. A link
-    referenced from pages on both sites (e.g. a homeschool page linking to a
-    highschool course) is counted under each site it's referenced from - it's a real
-    404 risk from either page's perspective.
+    """Per-site, per-page-kind link counts by status, plus a separate "watching"
+    count. A link referenced from pages on both sites (e.g. a homeschool page linking
+    to a highschool course) is counted under each site it's referenced from - it's a
+    real 404 risk from either page's perspective; the same logic applies one level
+    deeper for a link referenced from both a course page and an 'other' page of the
+    same site.
+
+    Split by kind rather than one total per site: the whole-site sweep's 'other' pages
+    (crawler.crawl_site) can outnumber course-page links by an order of magnitude, and
+    folding them into one total would bury the course-page numbers people already
+    watch.
     """
     site_slugs = [row["slug"] for row in conn.execute("SELECT slug FROM sites ORDER BY slug")]
 
     exclude_clause, exclude_params = exclusion_clause("links.host", "links.id")
     notok_placeholders, notok_params = _named_in("notok", NOT_OK_STATUSES)
 
-    # One grouped pass over the site<->link join: per-status counts and the separate
-    # "watching" count (failing but not yet confirmed) as conditional aggregates, rather
-    # than scanning the four-table join twice and pivoting in Python.
+    # One grouped pass over the site<->kind<->link join: per-status counts and the
+    # separate "watching" count (failing but not yet confirmed) as conditional
+    # aggregates, rather than scanning the four-table join twice and pivoting in Python.
     rows = conn.execute(
         f"""
-        SELECT sites.slug AS slug,
+        SELECT sites.slug AS slug, pages.kind AS kind,
             COUNT(DISTINCT CASE WHEN links.status = 'ok' THEN links.id END) AS ok,
             COUNT(DISTINCT CASE WHEN links.status = 'broken' THEN links.id END) AS broken,
             COUNT(DISTINCT CASE WHEN links.status = 'unreachable' THEN links.id END) AS unreachable,
@@ -193,32 +224,35 @@ def get_site_summaries(conn: sqlite3.Connection) -> list[SiteSummary]:
         JOIN links ON links.id = page_links.link_id
         WHERE 1=1
           {exclude_clause}
-        GROUP BY sites.slug
+        GROUP BY sites.slug, pages.kind
         """,
         {**notok_params, **exclude_params},
     ).fetchall()
-    by_slug = {row["slug"]: row for row in rows}
+    by_key = {(row["slug"], row["kind"]): row for row in rows}
 
     summaries = []
     for slug in site_slugs:
-        # A site with no linked pages yet produces no group row - report it as all zeros.
-        row = by_slug.get(slug)
-        ok, broken, unreachable, pending, watching = (
-            (row["ok"], row["broken"], row["unreachable"], row["pending"], row["watching"])
-            if row
-            else (0, 0, 0, 0, 0)
-        )
-        summaries.append(
-            SiteSummary(
-                slug=slug,
-                ok=ok,
-                broken=broken,
-                unreachable=unreachable,
-                pending=pending,
-                watching=watching,
-                total=ok + broken + unreachable + pending,
+        for kind in PAGE_KINDS:
+            # A (site, kind) combo with no linked pages yet produces no group row -
+            # report it as all zeros rather than omitting it.
+            row = by_key.get((slug, kind))
+            ok, broken, unreachable, pending, watching = (
+                (row["ok"], row["broken"], row["unreachable"], row["pending"], row["watching"])
+                if row
+                else (0, 0, 0, 0, 0)
             )
-        )
+            summaries.append(
+                SiteSummary(
+                    slug=slug,
+                    kind=kind,
+                    ok=ok,
+                    broken=broken,
+                    unreachable=unreachable,
+                    pending=pending,
+                    watching=watching,
+                    total=ok + broken + unreachable + pending,
+                )
+            )
     return summaries
 
 
@@ -239,6 +273,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
                page_links.context_after AS context_after,
                pages.title AS page_title, pages.url AS page_url, pages.id AS page_id,
                pages.last_crawled_at AS page_last_crawled_at,
+               pages.kind AS page_kind, pages.sort_order AS page_sort_order,
                sites.slug AS site_slug, sites.id AS site_id
         FROM page_links
         JOIN pages ON pages.id = page_links.page_id
@@ -259,6 +294,8 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
                 page_url=row["page_url"],
                 page_order=row["page_id"],
                 page_last_crawled_at=row["page_last_crawled_at"],
+                page_kind=row["page_kind"],
+                page_sort_order=row["page_sort_order"],
                 day_context=row["day_context"],
                 day_number=row["day_number"],
                 day_label=row["day_label"],
@@ -443,8 +480,9 @@ def render_text_report(
 ) -> str:
     lines = ["Site summary:"]
     for s in summaries:
+        label = f"{s.slug} ({s.kind})"
         lines.append(
-            f"  {s.slug:>12}: {s.total:>5} links   "
+            f"  {label:>20}: {s.total:>5} links   "
             f"ok={s.ok} broken={s.broken} unreachable={s.unreachable} "
             f"pending={s.pending} watching={s.watching}"
         )

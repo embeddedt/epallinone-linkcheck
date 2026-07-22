@@ -16,7 +16,13 @@ import httpx
 from bs4 import BeautifulSoup
 from bs4.element import Tag
 
-from linkcheck.config import CRAWL_CONCURRENCY, CRAWL_REQUEST_DELAY_SECONDS, USER_AGENT, Site
+from linkcheck.config import (
+    CRAWL_CONCURRENCY,
+    CRAWL_PAGE_LIST_PER_PAGE,
+    CRAWL_REQUEST_DELAY_SECONDS,
+    USER_AGENT,
+    Site,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,16 +120,11 @@ def _slug_from_url(url: str) -> str:
     return url.rstrip("/").rsplit("/", 1)[-1]
 
 
-# Sparse fieldset (WP core's `_fields` param) for the cheap "has this page changed"
-# check - a few hundred bytes instead of the full rendered body.
-PAGE_MODIFIED_FIELDS = "id,modified_gmt"
-
-
 async def _fetch_wp_page(
     client: httpx.AsyncClient, site: Site, slug: str, *, fields: str | None = None
 ) -> dict | None:
     """Look up a page by slug via the WP REST API. Returns the raw JSON object, or
-    None if the slug doesn't resolve to a page (course removed/renamed) or the API
+    None if the slug doesn't resolve to a page (page removed/renamed) or the API
     returned something unexpected.
 
     The REST API resolves by slug regardless of the page's URL path shape - verified
@@ -151,28 +152,50 @@ async def _fetch_wp_page(
     return results[0]
 
 
-async def fetch_page_modified(client: httpx.AsyncClient, site: Site, slug: str) -> str | None:
-    """Cheap check of a page's current `modified_gmt` via a sparse WP REST fieldset,
-    to decide whether a recrawl needs to fetch the full body at all. Verified live
-    against WordPress.com-hosted sites: no ETag/Last-Modified header is ever sent on
-    this endpoint and conditional GET (If-Modified-Since/If-None-Match) is ignored
-    outright, so this is done via WP's own `modified_gmt` field instead of HTTP
-    caching semantics. Returns None if the slug no longer resolves to a page - the
-    caller falls back to a full fetch either way, which resolves found-vs-not-found
-    on its own.
+# Sparse fieldset for the whole-site listing sweep (list_all_pages) - enough to tell
+# what exists and whether it changed, without paying for the full rendered body of
+# every page on the site.
+PAGE_LIST_FIELDS = "id,slug,link,modified_gmt"
+
+
+async def list_all_pages(
+    client: httpx.AsyncClient, site: Site, *, per_page: int = CRAWL_PAGE_LIST_PER_PAGE
+) -> list[dict]:
+    """Enumerate every page on the site - course pages and everything else the site's
+    WordPress serves under the 'pages' post type - via the REST API's paginated pages
+    collection, sparse-fielded down to id/slug/link/modified_gmt.
+
+    This is what makes a per-page modified_gmt check affordable at thousands-of-pages
+    scale: one request per ~100 pages gets existence *and* modified_gmt for the whole
+    site, instead of one request per page. `page` past the last one 400s
+    (`rest_post_invalid_page_number`) rather than returning an empty list, so the loop
+    is bounded by the `X-WP-TotalPages` response header from the first page instead of
+    probing until it fails.
     """
-    data = await _fetch_wp_page(client, site, slug, fields=PAGE_MODIFIED_FIELDS)
-    return data["modified_gmt"] if data else None
+    response = await client.get(
+        f"{site.base_url}/wp-json/wp/v2/pages",
+        params={"per_page": per_page, "page": 1, "_fields": PAGE_LIST_FIELDS},
+        headers={"User-Agent": USER_AGENT},
+    )
+    response.raise_for_status()
+    pages = list(response.json())
+    total_pages = int(response.headers.get("X-WP-TotalPages", "1"))
+    for page_num in range(2, total_pages + 1):
+        response = await client.get(
+            f"{site.base_url}/wp-json/wp/v2/pages",
+            params={"per_page": per_page, "page": page_num, "_fields": PAGE_LIST_FIELDS},
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        pages.extend(response.json())
+    return pages
 
 
-async def fetch_course_page(
-    client: httpx.AsyncClient, site: Site, course: CourseLink
-) -> CoursePage | None:
-    """Fetch a course page's rendered body via the WP REST API, by slug.
+async def fetch_page_by_slug(client: httpx.AsyncClient, site: Site, slug: str) -> CoursePage | None:
+    """Fetch a page's rendered body via the WP REST API, by slug - course page or not.
 
-    Returns None if the slug no longer resolves to a page (course removed/renamed).
+    Returns None if the slug no longer resolves to a page (removed/renamed).
     """
-    slug = _slug_from_url(course.url)
     data = await _fetch_wp_page(client, site, slug)
     if data is None:
         return None
@@ -184,6 +207,17 @@ async def fetch_course_page(
         html=data["content"]["rendered"],
         modified_gmt=data["modified_gmt"],
     )
+
+
+async def fetch_course_page(
+    client: httpx.AsyncClient, site: Site, course: CourseLink
+) -> CoursePage | None:
+    """Fetch a course page's rendered body via the WP REST API, by slug derived from
+    its course-index URL - a thin wrapper over fetch_page_by_slug for callers (the
+    discover-courses/crawl-preview manual verification commands) that only have a
+    CourseLink, not a bare slug, to start from.
+    """
+    return await fetch_page_by_slug(client, site, _slug_from_url(course.url))
 
 
 @dataclass(frozen=True)
@@ -463,17 +497,27 @@ def _get_site_id(conn: sqlite3.Connection, site_slug: str) -> int:
     return row["id"]
 
 
-def _upsert_page(conn: sqlite3.Connection, site_id: int, page: CoursePage) -> int:
+def _upsert_page(
+    conn: sqlite3.Connection, site_id: int, page: CoursePage, *, kind: str, sort_order: int | None
+) -> int:
+    """kind/sort_order are always overwritten on conflict, not just set on first
+    insert - crawl_site recomputes both fresh from the current course-index listing
+    every cycle, so this is what lets a page correctly flip between 'course' and
+    'other' if the course index itself changes, rather than trusting a stale value
+    forever.
+    """
     now = _now()
     row = conn.execute(
         """
-        INSERT INTO pages (site_id, url, slug, title, last_crawled_at, modified_gmt)
-        VALUES (:site_id, :url, :slug, :title, :now, :modified_gmt)
+        INSERT INTO pages (site_id, url, slug, title, last_crawled_at, modified_gmt, kind, sort_order)
+        VALUES (:site_id, :url, :slug, :title, :now, :modified_gmt, :kind, :sort_order)
         ON CONFLICT(site_id, url) DO UPDATE SET
             slug = excluded.slug,
             title = excluded.title,
             last_crawled_at = excluded.last_crawled_at,
-            modified_gmt = excluded.modified_gmt
+            modified_gmt = excluded.modified_gmt,
+            kind = excluded.kind,
+            sort_order = excluded.sort_order
         RETURNING id
         """,
         {
@@ -483,6 +527,8 @@ def _upsert_page(conn: sqlite3.Connection, site_id: int, page: CoursePage) -> in
             "title": page.title,
             "now": now,
             "modified_gmt": page.modified_gmt,
+            "kind": kind,
+            "sort_order": sort_order,
         },
     ).fetchone()
     return row["id"]
@@ -534,9 +580,16 @@ def _upsert_link(conn: sqlite3.Connection, url: str) -> int:
 
 
 def sync_course_page(
-    conn: sqlite3.Connection, site_slug: str, page: CoursePage, links: list[ExtractedLink]
+    conn: sqlite3.Connection,
+    site_slug: str,
+    page: CoursePage,
+    links: list[ExtractedLink],
+    *,
+    kind: str = "course",
+    sort_order: int | None = None,
 ) -> None:
-    """Upsert a crawled course page and its links, and drop stale associations.
+    """Upsert a crawled page (course or otherwise, see pages.kind) and its links, and
+    drop stale associations.
 
     Runs as one transaction: the page row, every link found on this crawl, and the
     page<->link associations are all upserted, then any `page_links` row for an
@@ -553,7 +606,7 @@ def sync_course_page(
     site_id = _get_site_id(conn, site_slug)
     now = _now()
     with conn:
-        page_id = _upsert_page(conn, site_id, page)
+        page_id = _upsert_page(conn, site_id, page, kind=kind, sort_order=sort_order)
 
         current_occurrences: set[tuple[int, str]] = set()
         for link in links:
@@ -601,10 +654,21 @@ def sync_course_page(
 
 @dataclass(frozen=True)
 class CrawlResult:
-    course: CourseLink
+    slug: str
+    title: str | None  # None for an 'unchanged' result - not worth a fetch just to report it
+    url: str
+    kind: str  # 'course' | 'other', see pages.kind
     found: bool
     link_count: int
     unchanged: bool = False  # modified_gmt matched the stored value - full body/parse skipped
+
+
+def _course_order(courses: list[CourseLink]) -> dict[str, int]:
+    """Course slug -> its rank in the course-index listing - both the signal that a
+    page is a course (kind='course') rather than 'other', and its report display
+    order (pages.sort_order).
+    """
+    return {_slug_from_url(course.url): i for i, course in enumerate(courses)}
 
 
 async def crawl_site(
@@ -617,13 +681,25 @@ async def crawl_site(
     request_delay: float = CRAWL_REQUEST_DELAY_SECONDS,
     force: bool = False,
 ) -> list[CrawlResult]:
-    """Discover, fetch, extract, and sync every course page for one site.
+    """Discover, fetch, extract, and sync every page on the site in one pass - course
+    pages *and* everything else the site's WordPress serves under the 'pages' post
+    type (kind='other' - reference/day-content pages a course page links to
+    internally, and anything else, checked exactly the same way as a course page).
+
+    Course identity/order comes from the course-index page (discover_courses_for_site);
+    which pages currently exist, and whether each one has changed, comes from one
+    paginated sweep of the WP REST API's whole pages collection (list_all_pages) - a
+    course page is just a page whose slug also happens to appear in that listing, kept
+    in sync exactly the same way as any other page. A course-index entry whose slug
+    doesn't show up in the listing at all (deleted/renamed course) still surfaces as a
+    not-found result, same as before this covered the whole site - list_all_pages
+    already tells us the full set of slugs that currently exist, so no extra request
+    is needed to notice.
 
     Bounded by a semaphore rather than fetching everything at once - out of
-    politeness to the site being crawled, not because our own volume here is large
-    (tens of course pages, not the thousands of leaf pages on the full site).
-    Calling the synchronous sync_course_page() from these concurrent coroutines needs
-    no lock - see the shared-connection note in scheduler.py for why.
+    politeness to the site being crawled. Calling the synchronous sync_course_page()
+    from these concurrent coroutines needs no lock - see the shared-connection note in
+    scheduler.py for why.
 
     force=True skips the modified_gmt cheap-check below so every page gets a full
     fetch/re-extract/sync regardless of whether WordPress reports it as changed - for
@@ -631,33 +707,58 @@ async def crawl_site(
     pages without waiting for their next real content edit.
     """
     courses = await discover_courses_for_site(client, site)
+    course_order = _course_order(courses)
+
+    listing = await list_all_pages(client, site)
+    # Courses first, in curriculum order, then everything else in whatever order the
+    # REST API returned it (sort is stable) - so a small --limit, used for quick manual
+    # sanity checks, still exercises course pages rather than an arbitrary slice of
+    # "other" pages.
+    listing.sort(key=lambda entry: course_order.get(entry["slug"], len(course_order)))
+    listing_slugs = {entry["slug"] for entry in listing}  # full set, before any --limit truncation
     if limit is not None:
-        courses = courses[:limit]
+        listing = listing[:limit]
 
     site_id = _get_site_id(conn, site.slug)
     semaphore = asyncio.Semaphore(concurrency)
 
-    async def _crawl_one(course: CourseLink) -> CrawlResult:
-        slug = _slug_from_url(course.url)
+    async def _crawl_one(entry: dict) -> CrawlResult:
+        slug = entry["slug"]
+        kind = "course" if slug in course_order else "other"
+        sort_order = course_order.get(slug)
         known = _known_page_state(conn, site_id, slug)
 
         async with semaphore:
-            # A page seen before gets a cheap modified_gmt check first - most course
-            # pages don't change day to day, so this skips the full body fetch and
-            # link re-extraction for the common case (see fetch_page_modified).
-            if not force and known is not None and known["modified_gmt"] is not None:
-                current_modified = await fetch_page_modified(client, site, slug)
-                await asyncio.sleep(request_delay)
-                if current_modified is not None and current_modified == known["modified_gmt"]:
-                    link_count = _touch_page_crawled(conn, known["id"])
-                    return CrawlResult(course=course, found=True, link_count=link_count, unchanged=True)
+            # modified_gmt already came from the listing sweep above, at no extra
+            # request cost - most pages don't change day to day, so this skips the
+            # full body fetch and link re-extraction for the common case.
+            if (
+                not force
+                and known is not None
+                and known["modified_gmt"] is not None
+                and entry["modified_gmt"] == known["modified_gmt"]
+            ):
+                link_count = _touch_page_crawled(conn, known["id"])
+                return CrawlResult(
+                    slug=slug, title=None, url=entry["link"], kind=kind,
+                    found=True, link_count=link_count, unchanged=True,
+                )
 
-            page = await fetch_course_page(client, site, course)
+            page = await fetch_page_by_slug(client, site, slug)
             await asyncio.sleep(request_delay)
         if page is None:
-            return CrawlResult(course=course, found=False, link_count=0)
+            return CrawlResult(slug=slug, title=None, url=entry["link"], kind=kind, found=False, link_count=0)
         links = extract_links(page.html, page.canonical_url, site.base_url)
-        sync_course_page(conn, site.slug, page, links)
-        return CrawlResult(course=course, found=True, link_count=len(links))
+        sync_course_page(conn, site.slug, page, links, kind=kind, sort_order=sort_order)
+        return CrawlResult(
+            slug=slug, title=page.title, url=page.canonical_url, kind=kind,
+            found=True, link_count=len(links),
+        )
 
-    return list(await asyncio.gather(*(_crawl_one(course) for course in courses)))
+    results = list(await asyncio.gather(*(_crawl_one(entry) for entry in listing)))
+    results.extend(
+        CrawlResult(slug=slug, title=course.title, url=course.url, kind="course", found=False, link_count=0)
+        for course in courses
+        if (slug := _slug_from_url(course.url)) not in listing_slugs
+    )
+    return results

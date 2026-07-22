@@ -17,6 +17,7 @@
   tbody.course-group .group-header td { background: #f5f5f5; font-weight: bold; border-top: 2px solid #999; cursor: pointer; user-select: none; }
   tbody.course-group .group-header td::before { content: "\25be"; display: inline-block; margin-right: 0.5rem; }
   tbody.course-group.collapsed .group-header td::before { content: "\25b8"; }
+  tbody.section-divider td { background: #333; color: #fff; font-weight: bold; text-align: center; border-top: 2px solid #999; }
   .mark-done-btn, .undo-done-btn, .copy-blurb-btn { font-size: 0.85rem; }
   .undo-done-btn { margin-top: 0.25rem; }
   .row-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
@@ -72,7 +73,12 @@
       <th></th>
     </tr>
   </thead>
+  {% set ns = namespace(shown_other_divider=false) %}
   {% for group in problem_groups %}
+  {% if group.kind == 'other' and not ns.shown_other_divider %}
+  <tbody class="section-divider"><tr><td colspan="5">Other pages (linked from course content, but not a course page themselves)</td></tr></tbody>
+  {% set ns.shown_other_divider = true %}
+  {% endif %}
   <tbody class="course-group" data-group-key="problem:{{ group.page_url }}">
     <tr class="group-header">
       <td colspan="5">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> (<span class="group-count" data-singular="broken link">{{ group.entries|length|pluralize('broken link') }}</span>){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
@@ -133,7 +139,12 @@
       <th>Next check</th>
     </tr>
   </thead>
+  {% set ns = namespace(shown_other_divider=false) %}
   {% for group in watch_groups %}
+  {% if group.kind == 'other' and not ns.shown_other_divider %}
+  <tbody class="section-divider"><tr><td colspan="5">Other pages (linked from course content, but not a course page themselves)</td></tr></tbody>
+  {% set ns.shown_other_divider = true %}
+  {% endif %}
   <tbody class="course-group" data-group-key="watch:{{ group.page_url }}">
     <tr class="group-header">
       <td colspan="5">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> ({{ group.entries|length|pluralize('watched link') }}){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>

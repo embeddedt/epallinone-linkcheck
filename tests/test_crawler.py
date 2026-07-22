@@ -12,7 +12,7 @@ from linkcheck.crawler import (
     crawl_site,
     discover_course_urls,
     fetch_course_page,
-    fetch_page_modified,
+    list_all_pages,
     sync_course_page,
 )
 
@@ -132,21 +132,20 @@ async def test_fetch_course_page_returns_none_on_wp_error_object():
 
 
 @pytest.mark.asyncio
-async def test_fetch_page_modified_returns_value_for_found_page():
+async def test_list_all_pages_follows_pagination_via_total_pages_header():
     def handler(request):
-        assert request.url.params["_fields"] == "id,modified_gmt"
-        return httpx.Response(200, json=[{"id": 7, "modified_gmt": "2023-05-26T19:33:31"}])
+        assert request.url.params["_fields"] == "id,slug,link,modified_gmt"
+        page_num = int(request.url.params["page"])
+        if page_num == 1:
+            return httpx.Response(
+                200, json=[{"id": 1, "slug": "a"}], headers={"X-WP-TotalPages": "2"}
+            )
+        assert page_num == 2
+        return httpx.Response(200, json=[{"id": 2, "slug": "b"}])
 
     async with _fetch_client(handler) as client:
-        modified = await fetch_page_modified(client, _SITE, "ep-math-1")
-    assert modified == "2023-05-26T19:33:31"
-
-
-@pytest.mark.asyncio
-async def test_fetch_page_modified_returns_none_for_missing_slug():
-    async with _fetch_client(lambda request: httpx.Response(200, json=[])) as client:
-        modified = await fetch_page_modified(client, _SITE, "ep-math-1")
-    assert modified is None
+        pages = await list_all_pages(client, _SITE)
+    assert [p["slug"] for p in pages] == ["a", "b"]
 
 
 _INDEX_HTML = """
@@ -156,12 +155,25 @@ _INDEX_HTML = """
 """
 
 
-def _crawl_client(*, index_html: str, wp_handler):
+def _crawl_client(*, index_html: str, listing_pages: list[list[dict]], slug_handler=None):
+    """Mocks the two request shapes crawl_site makes against /wp-json/wp/v2/pages:
+    the paginated whole-site listing sweep (a `page` param, no `slug`) and a per-page
+    full fetch (a `slug` param). `listing_pages` is one JSON array per listing page;
+    the total-pages header is derived from its length.
+    """
+
     def handler(request):
         if request.url.path == "/individual-courses-of-study/":
             return httpx.Response(200, text=index_html)
         if request.url.path == "/wp-json/wp/v2/pages":
-            return wp_handler(request)
+            if "slug" in request.url.params:
+                if slug_handler is None:
+                    raise AssertionError(f"unexpected full-fetch request: {request.url}")
+                return slug_handler(request)
+            page_num = int(request.url.params.get("page", "1"))
+            body = listing_pages[page_num - 1]
+            headers = {"X-WP-TotalPages": str(len(listing_pages))} if page_num == 1 else {}
+            return httpx.Response(200, json=body, headers=headers)
         raise AssertionError(f"unexpected request: {request.url}")
 
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -180,21 +192,20 @@ async def test_crawl_site_skips_full_fetch_for_unchanged_page():
         [ExtractedLink(url="https://ext.example.com/a", text="a", day_context=None)],
     )
 
-    full_fetch_calls = []
+    listing = [[{
+        "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+        "modified_gmt": "2023-05-26T19:33:31",
+    }]]
 
-    def wp_handler(request):
-        if "_fields" in request.url.params:
-            return httpx.Response(200, json=[{"id": 1, "modified_gmt": "2023-05-26T19:33:31"}])
-        full_fetch_calls.append(request)
-        raise AssertionError("full fetch should be skipped for an unchanged page")
-
-    async with _crawl_client(index_html=_INDEX_HTML, wp_handler=wp_handler) as client:
+    # No slug_handler: any full-fetch attempt raises inside the mock transport, which
+    # is how "full fetch should be skipped for an unchanged page" is enforced here.
+    async with _crawl_client(index_html=_INDEX_HTML, listing_pages=listing) as client:
         results = await crawl_site(conn, client, _SITE)
 
-    assert full_fetch_calls == []
     assert len(results) == 1
     assert results[0].found is True
     assert results[0].unchanged is True
+    assert results[0].kind == "course"
     assert results[0].link_count == 1  # unchanged link_count comes from the existing page_links row
 
 
@@ -211,10 +222,14 @@ async def test_crawl_site_force_does_full_fetch_even_when_unchanged():
         [ExtractedLink(url="https://ext.example.com/a", text="a", day_context=None)],
     )
 
-    def wp_handler(request):
-        # force=True must skip the cheap modified_gmt check (no "_fields" request)
-        # and go straight to a full fetch, even though modified_gmt is unchanged
-        assert "_fields" not in request.url.params
+    listing = [[{
+        "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+        "modified_gmt": "2023-05-26T19:33:31",
+    }]]
+
+    def slug_handler(request):
+        # force=True must skip the cheap modified_gmt check and go straight to a full
+        # fetch, even though the listing's modified_gmt is unchanged
         return httpx.Response(200, json=[{
             "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
             "title": {"rendered": "Math 1"},
@@ -222,7 +237,7 @@ async def test_crawl_site_force_does_full_fetch_even_when_unchanged():
             "modified_gmt": "2023-05-26T19:33:31",
         }])
 
-    async with _crawl_client(index_html=_INDEX_HTML, wp_handler=wp_handler) as client:
+    async with _crawl_client(index_html=_INDEX_HTML, listing_pages=listing, slug_handler=slug_handler) as client:
         results = await crawl_site(conn, client, _SITE, force=True)
 
     assert len(results) == 1
@@ -254,9 +269,12 @@ async def test_crawl_site_does_full_fetch_when_modified_gmt_changed():
         [ExtractedLink(url="https://ext.example.com/a", text="a", day_context=None)],
     )
 
-    def wp_handler(request):
-        if "_fields" in request.url.params:
-            return httpx.Response(200, json=[{"id": 1, "modified_gmt": "2024-01-01T00:00:00"}])
+    listing = [[{
+        "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+        "modified_gmt": "2024-01-01T00:00:00",
+    }]]
+
+    def slug_handler(request):
         return httpx.Response(200, json=[{
             "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
             "title": {"rendered": "Math 1"},
@@ -264,7 +282,7 @@ async def test_crawl_site_does_full_fetch_when_modified_gmt_changed():
             "modified_gmt": "2024-01-01T00:00:00",
         }])
 
-    async with _crawl_client(index_html=_INDEX_HTML, wp_handler=wp_handler) as client:
+    async with _crawl_client(index_html=_INDEX_HTML, listing_pages=listing, slug_handler=slug_handler) as client:
         results = await crawl_site(conn, client, _SITE)
 
     assert len(results) == 1
@@ -281,3 +299,100 @@ async def test_crawl_site_does_full_fetch_when_modified_gmt_changed():
 
     row = conn.execute("SELECT modified_gmt FROM pages WHERE slug = 'ep-math-1'").fetchone()
     assert row["modified_gmt"] == "2024-01-01T00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_tags_pages_outside_the_course_index_as_other():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+
+    listing = [[
+        {
+            "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+            "modified_gmt": "2023-01-01T00:00:00",
+        },
+        {
+            "id": 2, "slug": "odd-and-even", "link": "https://allinonehomeschool.com/odd-and-even/",
+            "modified_gmt": "2023-01-01T00:00:00",
+        },
+    ]]
+
+    def slug_handler(request):
+        slug = request.url.params["slug"]
+        if slug == "ep-math-1":
+            wp_id, title, href = 1, "Math 1", "https://ext.example.com/course-link"
+        else:
+            wp_id, title, href = 2, "Odd and Even", "https://ext.example.com/other-link"
+        return httpx.Response(200, json=[{
+            "id": wp_id, "slug": slug, "link": f"https://allinonehomeschool.com/{slug}/",
+            "title": {"rendered": title},
+            "content": {"rendered": f'<a href="{href}">link</a>'},
+            "modified_gmt": "2023-01-01T00:00:00",
+        }])
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing_pages=listing, slug_handler=slug_handler) as client:
+        results = await crawl_site(conn, client, _SITE)
+
+    by_slug = {r.slug: r for r in results}
+    assert by_slug["ep-math-1"].kind == "course"
+    assert by_slug["odd-and-even"].kind == "other"
+
+    rows = {row["slug"]: row for row in conn.execute("SELECT slug, kind, sort_order FROM pages")}
+    assert rows["ep-math-1"]["kind"] == "course"
+    assert rows["ep-math-1"]["sort_order"] == 0
+    assert rows["odd-and-even"]["kind"] == "other"
+    assert rows["odd-and-even"]["sort_order"] is None
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_reports_course_not_found_when_missing_from_listing():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+
+    # The course index still links to ep-math-1, but it no longer shows up anywhere in
+    # the whole-site listing (deleted/renamed) - still worth flagging, same as before
+    # crawl_site covered the whole site.
+    listing = [[]]
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing_pages=listing) as client:
+        results = await crawl_site(conn, client, _SITE)
+
+    assert len(results) == 1
+    assert results[0].slug == "ep-math-1"
+    assert results[0].kind == "course"
+    assert results[0].found is False
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_limit_still_prioritizes_course_pages():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+
+    # "other" page listed before the course page, as the REST API might return it -
+    # --limit=1 must still pick the course page, not this one, for a small manual
+    # sanity check to stay useful.
+    listing = [[
+        {
+            "id": 2, "slug": "odd-and-even", "link": "https://allinonehomeschool.com/odd-and-even/",
+            "modified_gmt": "2023-01-01T00:00:00",
+        },
+        {
+            "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+            "modified_gmt": "2023-01-01T00:00:00",
+        },
+    ]]
+
+    def slug_handler(request):
+        assert request.url.params["slug"] == "ep-math-1"
+        return httpx.Response(200, json=[{
+            "id": 1, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+            "title": {"rendered": "Math 1"},
+            "content": {"rendered": '<a href="https://ext.example.com/a">a</a>'},
+            "modified_gmt": "2023-01-01T00:00:00",
+        }])
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing_pages=listing, slug_handler=slug_handler) as client:
+        results = await crawl_site(conn, client, _SITE, limit=1)
+
+    assert len(results) == 1
+    assert results[0].slug == "ep-math-1"

@@ -37,6 +37,11 @@ CRAWL_CONCURRENCY = 5
 CRAWL_REQUEST_DELAY_SECONDS = 0.2
 CRAWL_TIMEOUT_SECONDS = 20  # per-request timeout for course-index and page fetches
 
+# Page size for the whole-site listing sweep (crawler.list_all_pages) - the ceiling
+# WordPress's own REST API enforces for `per_page`, not a politeness choice; a larger
+# value 400s.
+CRAWL_PAGE_LIST_PER_PAGE = 100
+
 # --- check phase / reporting ---
 # Standardized "never check, never show up" rules. Each rule declares its own SQL
 # predicate (a plain host NOT IN for HostBlacklistRule, a correlated EXISTS over

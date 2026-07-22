@@ -18,6 +18,15 @@ CREATE TABLE IF NOT EXISTS pages (
     last_crawled_at TEXT,
     modified_gmt TEXT,                     -- WP REST API's `modified_gmt` as of last crawl;
                                             -- lets a recrawl skip re-parsing an unchanged page
+    kind TEXT NOT NULL DEFAULT 'course',   -- 'course' | 'other' - 'course' is a page
+                                            -- discovered from the course-index listing;
+                                            -- 'other' is any other page the site's
+                                            -- WordPress serves (reference pages, day
+                                            -- content, answer keys, ...), found by the
+                                            -- whole-site sweep (crawler.list_all_pages)
+    sort_order INTEGER,                    -- course pages: rank in the course-index
+                                            -- listing, for report display order; NULL
+                                            -- for 'other' pages (see report.py)
     UNIQUE(site_id, url)
 );
 
