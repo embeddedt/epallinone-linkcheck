@@ -42,6 +42,17 @@ CRAWL_TIMEOUT_SECONDS = 20  # per-request timeout for course-index and page fetc
 # value 400s.
 CRAWL_PAGE_LIST_PER_PAGE = 100
 
+# Retry/backoff for a 429 from the site itself (a fronting CDN/WAF, not necessarily
+# WordPress) - observed in practice under the whole-site sweep's request volume
+# (thousands of pages), never under a handful of course-page fetches. A quick burst of
+# 60+ concurrent requests against the live site didn't trigger it, so this is a
+# sustained-volume/longer-window threshold, not a per-request or short-burst one -
+# backed off with exponential delay rather than tuned to a specific number of
+# requests/second, since the actual threshold isn't published and may change.
+CRAWL_RATE_LIMIT_MAX_RETRIES = 5
+CRAWL_RATE_LIMIT_BASE_DELAY_SECONDS = 5.0  # doubles each retry; used only when the
+                                            # response doesn't send a Retry-After header
+
 # --- check phase / reporting ---
 # Standardized "never check, never show up" rules. Each rule declares its own SQL
 # predicate (a plain host NOT IN for HostBlacklistRule, a correlated EXISTS over

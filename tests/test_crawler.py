@@ -3,12 +3,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from linkcheck import db
-from linkcheck.config import Site
+from linkcheck import crawler, db
+from linkcheck.config import CRAWL_RATE_LIMIT_MAX_RETRIES, Site
 from linkcheck.crawler import (
     CourseLink,
     CoursePage,
     ExtractedLink,
+    _retry_after_seconds,
     crawl_site,
     discover_course_urls,
     fetch_course_page,
@@ -129,6 +130,87 @@ async def test_fetch_course_page_returns_none_on_wp_error_object():
     async with _fetch_client(handler) as client:
         page = await fetch_course_page(client, _SITE, _COURSE)
     assert page is None
+
+
+def test_retry_after_seconds_parses_numeric_value():
+    response = httpx.Response(429, headers={"Retry-After": "12"})
+    assert _retry_after_seconds(response) == 12.0
+
+
+def test_retry_after_seconds_parses_http_date():
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    target = datetime.now(UTC) + timedelta(seconds=30)
+    response = httpx.Response(429, headers={"Retry-After": format_datetime(target, usegmt=True)})
+    seconds = _retry_after_seconds(response)
+    assert seconds is not None
+    assert 20 <= seconds <= 30  # slack for test execution time and second-precision formatting
+
+
+def test_retry_after_seconds_returns_none_when_absent():
+    assert _retry_after_seconds(httpx.Response(429)) is None
+
+
+def test_retry_after_seconds_returns_none_when_unparseable():
+    response = httpx.Response(429, headers={"Retry-After": "not-a-value"})
+    assert _retry_after_seconds(response) is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_retries_after_429_honoring_retry_after_then_succeeds():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"Retry-After": "0"})
+        return httpx.Response(200, json=[{
+            "id": 7, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+            "title": {"rendered": "Math 1"}, "content": {"rendered": "<p>body</p>"},
+            "modified_gmt": "2023-05-26T19:33:31",
+        }])
+
+    async with _fetch_client(handler) as client:
+        page = await fetch_course_page(client, _SITE, _COURSE)
+    assert len(calls) == 2
+    assert page is not None
+    assert page.title == "Math 1"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_falls_back_to_backoff_without_retry_after_header(monkeypatch):
+    monkeypatch.setattr(crawler, "CRAWL_RATE_LIMIT_BASE_DELAY_SECONDS", 0.01)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(429)  # no Retry-After header at all
+        return httpx.Response(200, json=[{
+            "id": 7, "slug": "ep-math-1", "link": "https://allinonehomeschool.com/ep-math-1/",
+            "title": {"rendered": "Math 1"}, "content": {"rendered": "<p>body</p>"},
+            "modified_gmt": "2023-05-26T19:33:31",
+        }])
+
+    async with _fetch_client(handler) as client:
+        page = await fetch_course_page(client, _SITE, _COURSE)
+    assert len(calls) == 2
+    assert page is not None
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_gives_up_after_max_retries():
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(429, headers={"Retry-After": "0"})
+
+    async with _fetch_client(handler) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await fetch_course_page(client, _SITE, _COURSE)
+    assert len(calls) == CRAWL_RATE_LIMIT_MAX_RETRIES + 1
 
 
 @pytest.mark.asyncio

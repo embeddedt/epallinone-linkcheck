@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import random
 import re
 import sqlite3
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -19,6 +21,8 @@ from bs4.element import Tag
 from linkcheck.config import (
     CRAWL_CONCURRENCY,
     CRAWL_PAGE_LIST_PER_PAGE,
+    CRAWL_RATE_LIMIT_BASE_DELAY_SECONDS,
+    CRAWL_RATE_LIMIT_MAX_RETRIES,
     CRAWL_REQUEST_DELAY_SECONDS,
     USER_AGENT,
     Site,
@@ -95,9 +99,60 @@ def discover_course_urls(html: str, index_url: str, base_url: str) -> list[Cours
     return [CourseLink(url=url, title=title) for url, title in seen.items()]
 
 
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Parse a `Retry-After` header per RFC 7231 - either delta-seconds or an
+    HTTP-date - into seconds to wait. None if the header is absent or unparseable,
+    since not every 429 source sends one.
+    """
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        target = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return max(0.0, (target - datetime.now(UTC)).total_seconds())
+
+
+async def _get_with_retry(
+    client: httpx.AsyncClient, url: str, *, params: dict | None = None, follow_redirects: bool = False
+) -> httpx.Response:
+    """GET with bounded retry/backoff on a 429 - seen in practice from the site itself
+    (a fronting CDN/WAF, not necessarily WordPress) under the whole-site sweep's
+    request volume, never under a handful of course-page fetches. Honors Retry-After
+    when the response sends one; falls back to exponential backoff with jitter
+    otherwise, since it may not.
+    """
+    delay = CRAWL_RATE_LIMIT_BASE_DELAY_SECONDS
+    for attempt in range(CRAWL_RATE_LIMIT_MAX_RETRIES + 1):
+        response = await client.get(
+            url, params=params, headers={"User-Agent": USER_AGENT}, follow_redirects=follow_redirects
+        )
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response
+        if attempt == CRAWL_RATE_LIMIT_MAX_RETRIES:
+            response.raise_for_status()  # retries exhausted - surface the 429 as before
+        wait = _retry_after_seconds(response)
+        if wait is None:
+            wait = delay + random.uniform(0, delay)  # jitter so concurrent tasks don't retry in lockstep
+            delay *= 2
+        logger.warning(
+            "429 from %s, retrying in %.1fs (attempt %d/%d)",
+            url, wait, attempt + 1, CRAWL_RATE_LIMIT_MAX_RETRIES,
+        )
+        await asyncio.sleep(wait)
+    raise AssertionError("unreachable")  # loop above always returns or raises
+
+
 async def fetch(client: httpx.AsyncClient, url: str) -> str:
-    response = await client.get(url, headers={"User-Agent": USER_AGENT}, follow_redirects=True)
-    response.raise_for_status()
+    response = await _get_with_retry(client, url, follow_redirects=True)
     return response.text
 
 
@@ -134,12 +189,7 @@ async def _fetch_wp_page(
     params = {"slug": slug}
     if fields is not None:
         params["_fields"] = fields
-    response = await client.get(
-        f"{site.base_url}/wp-json/wp/v2/pages",
-        params=params,
-        headers={"User-Agent": USER_AGENT},
-    )
-    response.raise_for_status()
+    response = await _get_with_retry(client, f"{site.base_url}/wp-json/wp/v2/pages", params=params)
     results = response.json()
     # A found page is a non-empty JSON array; a missing slug is []. A WP REST *error*
     # is a JSON object ({"code": ..., "message": ...}), which would sail past a bare
@@ -172,21 +222,19 @@ async def list_all_pages(
     is bounded by the `X-WP-TotalPages` response header from the first page instead of
     probing until it fails.
     """
-    response = await client.get(
+    response = await _get_with_retry(
+        client,
         f"{site.base_url}/wp-json/wp/v2/pages",
         params={"per_page": per_page, "page": 1, "_fields": PAGE_LIST_FIELDS},
-        headers={"User-Agent": USER_AGENT},
     )
-    response.raise_for_status()
     pages = list(response.json())
     total_pages = int(response.headers.get("X-WP-TotalPages", "1"))
     for page_num in range(2, total_pages + 1):
-        response = await client.get(
+        response = await _get_with_retry(
+            client,
             f"{site.base_url}/wp-json/wp/v2/pages",
             params={"per_page": per_page, "page": page_num, "_fields": PAGE_LIST_FIELDS},
-            headers={"User-Agent": USER_AGENT},
         )
-        response.raise_for_status()
         pages.extend(response.json())
     return pages
 
