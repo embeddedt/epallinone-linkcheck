@@ -17,7 +17,8 @@
   tbody.course-group .group-header td { background: #f5f5f5; font-weight: bold; border-top: 2px solid #999; cursor: pointer; user-select: none; }
   tbody.course-group .group-header td::before { content: "\25be"; display: inline-block; margin-right: 0.5rem; }
   tbody.course-group.collapsed .group-header td::before { content: "\25b8"; }
-  tbody.section-divider td { background: #333; color: #fff; font-weight: bold; text-align: center; border-top: 2px solid #999; }
+  tbody.site-divider td { background: #222; color: #fff; font-weight: bold; font-size: 1.15rem; text-align: center; text-transform: capitalize; border-top: 3px solid #000; padding: 8px; }
+  tbody.section-divider td { background: #777; color: #fff; font-weight: bold; text-align: center; border-top: 2px solid #999; }
   .mark-done-btn, .undo-done-btn, .copy-blurb-btn { font-size: 0.85rem; }
   .undo-done-btn { margin-top: 0.25rem; }
   .row-actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
@@ -73,8 +74,13 @@
       <th></th>
     </tr>
   </thead>
-  {% set ns = namespace(shown_other_divider=false) %}
+  {% set ns = namespace(current_site=none, shown_other_divider=false) %}
   {% for group in problem_groups %}
+  {% if group.site_slug != ns.current_site %}
+  <tbody class="site-divider"><tr><td colspan="5">{{ group.site_slug }}</td></tr></tbody>
+  {% set ns.current_site = group.site_slug %}
+  {% set ns.shown_other_divider = false %}
+  {% endif %}
   {% if group.kind == 'other' and not ns.shown_other_divider %}
   <tbody class="section-divider"><tr><td colspan="5">Other pages (linked from course content, but not a course page themselves)</td></tr></tbody>
   {% set ns.shown_other_divider = true %}
@@ -139,8 +145,13 @@
       <th>Next check</th>
     </tr>
   </thead>
-  {% set ns = namespace(shown_other_divider=false) %}
+  {% set ns = namespace(current_site=none, shown_other_divider=false) %}
   {% for group in watch_groups %}
+  {% if group.site_slug != ns.current_site %}
+  <tbody class="site-divider"><tr><td colspan="5">{{ group.site_slug }}</td></tr></tbody>
+  {% set ns.current_site = group.site_slug %}
+  {% set ns.shown_other_divider = false %}
+  {% endif %}
   {% if group.kind == 'other' and not ns.shown_other_divider %}
   <tbody class="section-divider"><tr><td colspan="5">Other pages (linked from course content, but not a course page themselves)</td></tr></tbody>
   {% set ns.shown_other_divider = true %}

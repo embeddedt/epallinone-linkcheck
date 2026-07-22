@@ -348,6 +348,53 @@ def test_render_html_report_separates_other_pages_section(conn):
     assert html.index("Math 1") < html.index("Other pages") < html.index("Odd And Even")
 
 
+def test_render_html_report_separates_other_pages_per_site(conn):
+    # groups are ordered site-major (all of homeschool, then all of highschool) - the
+    # divider must reset per site rather than showing once ever, or a second site's
+    # course pages end up trailing the first site's divider with nothing to mark them
+    # as back to courses.
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/hs-course-broken", text="a", day_context=None)],
+        kind="course", sort_order=0,
+    )
+    _sync(
+        conn, "homeschool", "odd-and-even", "https://allinonehomeschool.com/odd-and-even/",
+        [ExtractedLink(url="https://ext.example.com/hs-other-broken", text="b", day_context=None)],
+        kind="other",
+    )
+    _sync(
+        conn, "highschool", "algebra-1", "https://allinonehighschool.com/algebra-1/",
+        [ExtractedLink(url="https://ext.example.com/hi-course-broken", text="c", day_context=None)],
+        kind="course", sort_order=0,
+    )
+    _sync(
+        conn, "highschool", "some-reference-page", "https://allinonehighschool.com/some-reference-page/",
+        [ExtractedLink(url="https://ext.example.com/hi-other-broken", text="d", day_context=None)],
+        kind="other",
+    )
+    _confirm_broken(conn)
+
+    html = report.render_html_report(report.get_problem_links(conn), report.get_watch_links(conn))
+    # one site-level divider per site, one "Other pages" sub-divider per site
+    assert html.count('<td colspan="5">homeschool</td>') == 1
+    assert html.count('<td colspan="5">highschool</td>') == 1
+    assert html.count("Other pages") == 2
+
+    i_hs_site = html.index('<td colspan="5">homeschool</td>')
+    i_hs_course = html.index("Math 1")
+    i_hs_other_divider = html.index("Other pages")
+    i_hs_other = html.index("Odd And Even")
+    i_hi_site = html.index('<td colspan="5">highschool</td>')
+    i_hi_course = html.index("Algebra 1")
+    i_hi_other_divider = html.rindex("Other pages")  # second (last) occurrence
+    i_hi_other = html.index("Some Reference Page")
+    assert (
+        i_hs_site < i_hs_course < i_hs_other_divider < i_hs_other
+        < i_hi_site < i_hi_course < i_hi_other_divider < i_hi_other
+    )
+
+
 def test_render_html_report_no_other_pages_divider_when_all_course(conn):
     _sync(
         conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
