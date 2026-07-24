@@ -243,6 +243,16 @@ AIA_CHASE_TIMEOUT_SECONDS = 10
 AIA_CHASE_MAX_HOPS = 5  # generous cap on chain length; guards against a pathological
                         # or cyclical AIA reference chain rather than trusting one blindly
 
+# Some servers send a response with a header line that violates RFC 7230's header
+# grammar (seen in practice: helpteaching.com appending a stray "https 200 OK: "
+# line) - httpx's parser (h11) is strict and aborts the whole request with
+# RemoteProtocolError, even though the response is otherwise a normal 200 that every
+# real browser renders fine. stdlib http.client's header parsing is far more
+# permissive and accepts these, so a bad-header failure gets one retry through it
+# before falling back to the httpx error. Off falls back to the plain `other`
+# classification with no retry.
+CHECK_LENIENT_HTTP_FALLBACK = True
+
 # A domain_claims row older than this is treated as an abandoned claim from a crashed
 # process and purged rather than trusted - comfortably above CHECK_TIMEOUT_SECONDS so
 # a genuinely slow-but-alive check is never mistaken for one.

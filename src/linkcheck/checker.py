@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import http.client
 import logging
 import random
 import socket
 import sqlite3
 import ssl
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -20,7 +22,10 @@ from linkcheck.config import (
     BROKEN_RECHECK_DAYS,
     CHECK_AIA_CHASE,
     CHECK_HTTPS_UPGRADE,
+    CHECK_LENIENT_HTTP_FALLBACK,
+    CHECK_MAX_REDIRECTS,
     CHECK_ONESHOT_POLL_SECONDS,
+    CHECK_TIMEOUT_SECONDS,
     HEALTHY_RECHECK_DAYS,
     RECHECK_JITTER_FRACTION,
     UNCONFIRMED_RETRY_MINUTES,
@@ -137,6 +142,54 @@ async def _fetch_via_aia_chase(url: str) -> CheckResult | None:
         return None
 
 
+def _lenient_get(url: str, timeout: float) -> int:
+    """Blocking GET via stdlib http.client, whose header parsing (built on
+    email.parser) accepts lines that violate RFC 7230 grammar instead of aborting
+    like h11 does - split out so tests can monkeypatch the connection classes
+    instead of hitting real sockets. Follows redirects itself (http.client doesn't)
+    up to CHECK_MAX_REDIRECTS hops, and never reads the response body since only the
+    status is needed.
+    """
+    for _ in range(CHECK_MAX_REDIRECTS + 1):
+        parsed = urllib.parse.urlsplit(url)
+        conn_cls = (
+            http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+        )
+        conn = conn_cls(parsed.hostname, parsed.port, timeout=timeout)
+        try:
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            conn.request("GET", path, headers={"User-Agent": USER_AGENT})
+            response = conn.getresponse()
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.getheader("Location")
+                response.close()
+                if not location:
+                    return response.status
+                url = urllib.parse.urljoin(url, location)
+                continue
+            return response.status
+        finally:
+            conn.close()
+    raise RuntimeError(f"too many redirects: {url}")
+
+
+async def _fetch_via_lenient_http_client(url: str) -> CheckResult | None:
+    """After httpx/h11 rejects a response for violating RFC 7230 header syntax, retry
+    once via stdlib http.client (see _lenient_get) off the event loop - http.client
+    has no async mode, so the blocking call runs in a thread. Returns None - falling
+    back to the original RemoteProtocolError result - if the retry fails for any
+    reason, including a *different* problem the lenient parser doesn't paper over.
+    """
+    start = time.monotonic()
+    try:
+        status = await asyncio.to_thread(_lenient_get, url, CHECK_TIMEOUT_SECONDS)
+    except Exception:
+        return None
+    return CheckResult(status, None, int((time.monotonic() - start) * 1000))
+
+
 async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
     """One GET attempt against url. Streams the response and closes after headers -
     never downloads the full body, since we only care about the status code.
@@ -162,6 +215,12 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
             if chased is not None:
                 return chased
         return CheckResult(None, error_type, elapsed_ms())
+    except httpx.RemoteProtocolError:
+        if CHECK_LENIENT_HTTP_FALLBACK:
+            recovered = await _fetch_via_lenient_http_client(url)
+            if recovered is not None:
+                return recovered
+        return CheckResult(None, ERROR_OTHER, elapsed_ms())
     except httpx.RequestError:
         return CheckResult(None, ERROR_OTHER, elapsed_ms())
     except ValueError:

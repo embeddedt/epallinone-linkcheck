@@ -1,3 +1,4 @@
+import http.client
 import socket
 import ssl
 from datetime import UTC, datetime, timedelta
@@ -313,6 +314,115 @@ async def test_check_link_skips_aia_chase_entirely_when_disabled(monkeypatch):
         result = await check_link(client, "https://x.test/bad-cert")
 
     assert result.error_type == "bad_ssl_cert"
+
+
+# --- lenient http.client fallback recovery from a malformed-header RemoteProtocolError ---
+#
+# _lenient_get is monkeypatched at the check_link level (mirroring the AIA chase
+# tests above) so the retry doesn't hit a real socket; _lenient_get's own redirect-
+# following logic gets a direct unit test below with a fake http.client connection.
+
+
+def _bad_header_handler(request):
+    raise httpx.RemoteProtocolError("illegal header line: b'https 200 OK: '", request=request)
+
+
+@pytest.mark.asyncio
+async def test_check_link_recovers_via_lenient_http_client_when_retry_succeeds(monkeypatch):
+    monkeypatch.setattr(linkcheck.checker, "_lenient_get", lambda url, timeout: 200)
+
+    async with _client(_bad_header_handler) as client:
+        result = await check_link(client, "https://x.test/bad-header")
+
+    assert result.http_status == 200
+    assert result.error_type is None
+
+
+@pytest.mark.asyncio
+async def test_check_link_falls_back_to_other_when_lenient_retry_also_fails(monkeypatch):
+    def still_fails(url, timeout):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(linkcheck.checker, "_lenient_get", still_fails)
+
+    async with _client(_bad_header_handler) as client:
+        result = await check_link(client, "https://x.test/bad-header")
+
+    assert result.http_status is None
+    assert result.error_type == "other"
+
+
+@pytest.mark.asyncio
+async def test_check_link_skips_lenient_fallback_entirely_when_disabled(monkeypatch):
+    def should_not_be_called(url, timeout):
+        raise AssertionError("_lenient_get must not run when CHECK_LENIENT_HTTP_FALLBACK is off")
+
+    monkeypatch.setattr(linkcheck.checker, "CHECK_LENIENT_HTTP_FALLBACK", False)
+    monkeypatch.setattr(linkcheck.checker, "_lenient_get", should_not_be_called)
+
+    async with _client(_bad_header_handler) as client:
+        result = await check_link(client, "https://x.test/bad-header")
+
+    assert result.http_status is None
+    assert result.error_type == "other"
+
+
+class _FakeHttpResponse:
+    def __init__(self, status, headers=None):
+        self.status = status
+        self._headers = headers or {}
+
+    def getheader(self, name):
+        return self._headers.get(name)
+
+    def close(self):
+        pass
+
+
+class _FakeHttpConnection:
+    """Stand-in for http.client.HTTPSConnection - records requested host+path pairs
+    and returns canned responses in sequence, so _lenient_get's own redirect-following
+    can be tested without a real socket."""
+
+    calls: list[str] = []
+    responses: list[_FakeHttpResponse] = []
+
+    def __init__(self, host, port, timeout=None):
+        self.host = host
+
+    def request(self, method, path, headers=None):
+        _FakeHttpConnection.calls.append(f"{self.host}{path}")
+
+    def getresponse(self):
+        return _FakeHttpConnection.responses.pop(0)
+
+    def close(self):
+        pass
+
+
+def test_lenient_get_follows_redirects_and_returns_final_status(monkeypatch):
+    _FakeHttpConnection.calls = []
+    _FakeHttpConnection.responses = [
+        _FakeHttpResponse(301, {"Location": "/next"}),
+        _FakeHttpResponse(200),
+    ]
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHttpConnection)
+
+    status = linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
+
+    assert status == 200
+    assert _FakeHttpConnection.calls == ["x.test/start", "x.test/next"]
+
+
+def test_lenient_get_gives_up_after_too_many_redirects(monkeypatch):
+    _FakeHttpConnection.calls = []
+    _FakeHttpConnection.responses = [
+        _FakeHttpResponse(302, {"Location": "/start"}) for _ in range(50)
+    ]
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHttpConnection)
+
+    with pytest.raises(RuntimeError):
+        linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
 
 
 @pytest.mark.asyncio
