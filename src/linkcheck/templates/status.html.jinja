@@ -93,6 +93,7 @@
     <tr class="row" data-status="{{ entry.link.status }}" data-link-id="{{ entry.link.id }}"
         data-occurrence-id="{{ group.page_url }}::{{ entry.link.id }}::{{ entry.day_context }}"
         data-last-checked-at="{{ entry.link.last_checked_at or '' }}"
+        data-source="problem"
         data-course="{{ group.site_slug }}: {{ group.page_title }}"
         data-link-text="{{ entry.link_text or '' }}"
         data-context-before="{{ entry.context_before or '' }}"
@@ -122,7 +123,7 @@
 {% endif %}
 
 {% if watch_links %}
-<h3>Watching ({{ watch_links|length }})</h3>
+<h3>Watching (<span id="watch-count">{{ watch_links|length }}</span>)</h3>
 <p>
   Failed at least one check but not confirmed broken/unreachable yet - could be a
   transient blip. Will be rechecked automatically; only moves into the list above
@@ -130,11 +131,12 @@
 </p>
 <table id="watch-table">
   <colgroup>
+    <col style="width: 7%">
     <col style="width: 8%">
-    <col style="width: 10%">
-    <col style="width: 27%">
-    <col style="width: 35%">
-    <col style="width: 20%">
+    <col style="width: 25%">
+    <col style="width: 30%">
+    <col style="width: 15%">
+    <col style="width: 15%">
   </colgroup>
   <thead>
     <tr>
@@ -143,25 +145,30 @@
       <th>Link name</th>
       <th>Link</th>
       <th>Next check</th>
+      <th></th>
     </tr>
   </thead>
   {% set ns = namespace(current_site=none, shown_other_divider=false) %}
   {% for group in watch_groups %}
   {% if group.site_slug != ns.current_site %}
-  <tbody class="site-divider"><tr><td colspan="5">{{ group.site_slug }}</td></tr></tbody>
+  <tbody class="site-divider"><tr><td colspan="6">{{ group.site_slug }}</td></tr></tbody>
   {% set ns.current_site = group.site_slug %}
   {% set ns.shown_other_divider = false %}
   {% endif %}
   {% if group.kind == 'other' and not ns.shown_other_divider %}
-  <tbody class="section-divider"><tr><td colspan="5">Other pages (linked from course content, but not a course page themselves)</td></tr></tbody>
+  <tbody class="section-divider"><tr><td colspan="6">Other pages (linked from course content, but not a course page themselves)</td></tr></tbody>
   {% set ns.shown_other_divider = true %}
   {% endif %}
   <tbody class="course-group" data-group-key="watch:{{ group.page_url }}">
     <tr class="group-header">
-      <td colspan="5">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> ({{ group.entries|length|pluralize('watched link') }}){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
+      <td colspan="6">{{ group.site_slug }}: <a href="{{ group.page_url }}" target="_blank" rel="noopener noreferrer">{{ group.page_title }}</a> (<span class="group-count" data-singular="watched link">{{ group.entries|length|pluralize('watched link') }}</span>){% if group.last_crawled_at %} &mdash; last scanned course page <time class="relative-time" datetime="{{ group.last_crawled_at }}">{{ group.last_crawled_at }}</time>{% endif %}</td>
     </tr>
     {% for entry in group.entries %}
-    <tr>
+    <tr class="watch-row" data-link-id="{{ entry.link.id }}"
+        data-occurrence-id="watch::{{ group.page_url }}::{{ entry.link.id }}::{{ entry.day_context }}"
+        data-last-checked-at="{{ entry.link.last_checked_at or '' }}"
+        data-source="watch"
+        data-course="{{ group.site_slug }}: {{ group.page_title }}">
       <td class="status-watching">watching</td>
       <td>{{ entry.link|outcome }}</td>
       <td>
@@ -170,6 +177,11 @@
       </td>
       <td><a href="{{ entry.link.url }}" target="_blank" rel="noopener noreferrer">{{ entry.link.url }}</a></td>
       <td><time class="relative-time" datetime="{{ entry.link.next_check_at }}">{{ entry.link.next_check_at }}</time></td>
+      <td>
+        <div class="row-actions">
+          <button type="button" class="mark-done-btn" data-occurrence-id="watch::{{ group.page_url }}::{{ entry.link.id }}::{{ entry.day_context }}">Mark done</button>
+        </div>
+      </td>
     </tr>
     {% endfor %}
   </tbody>
@@ -185,12 +197,13 @@
 </p>
 <table id="marked-done-table">
   <colgroup>
-    <col style="width: 14%">
-    <col style="width: 7%">
-    <col style="width: 9%">
-    <col style="width: 22%">
-    <col style="width: 30%">
-    <col style="width: 18%">
+    <col style="width: 13%">
+    <col style="width: 6%">
+    <col style="width: 8%">
+    <col style="width: 20%">
+    <col style="width: 25%">
+    <col style="width: 13%">
+    <col style="width: 15%">
   </colgroup>
   <thead>
     <tr>
@@ -198,7 +211,8 @@
       <th>Status</th>
       <th>Reason</th>
       <th>Link name</th>
-      <th>Broken link</th>
+      <th>Link</th>
+      <th>Next check</th>
       <th></th>
     </tr>
   </thead>
@@ -260,8 +274,8 @@
   var activeStatus = "all";
 
   function rowMatchesFilter(row) {
-    if (!row.classList.contains("row")) return true;
     if (row.dataset.occurrenceId && Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) return false;
+    if (!row.classList.contains("row")) return true;
     var q = (search && search.value || "").toLowerCase();
     var matchesStatus = activeStatus === "all" || row.dataset.status === activeStatus;
     var matchesSearch = !q || row.dataset.search.indexOf(q) !== -1;
@@ -325,6 +339,7 @@
   var legacyDoneIds = loadDoneMap();
   var doneMap = legacyDoneIds === null ? {} : legacyDoneIds;
   var problemTable = document.getElementById("problem-table");
+  var watchTable = document.getElementById("watch-table");
   var doneTbody = document.getElementById("marked-done-tbody");
   var doneWrapper = document.getElementById("marked-done-wrapper");
 
@@ -357,17 +372,21 @@
 
   // Resurface anything that's been rechecked since it was marked done - the checker
   // ran again and it's still showing up here, so it's a fresh failure the user hasn't
-  // seen yet, not the one they dismissed.
+  // seen yet, not the one they dismissed. Runs over both tables since a watching link
+  // marked done can later graduate into the broken/unreachable table (same occurrence
+  // id, new last_checked_at) and vice versa is never possible but costs nothing to check.
   (function reconcileDoneMap() {
-    if (!problemTable) return;
     var changed = false;
-    problemTable.querySelectorAll("tr.row[data-occurrence-id]").forEach(function (row) {
-      var occId = row.dataset.occurrenceId;
-      if (!Object.prototype.hasOwnProperty.call(doneMap, occId)) return;
-      if (doneMap[occId] !== (row.dataset.lastCheckedAt || "")) {
-        delete doneMap[occId];
-        changed = true;
-      }
+    [problemTable, watchTable].forEach(function (table) {
+      if (!table) return;
+      table.querySelectorAll("tr[data-occurrence-id]").forEach(function (row) {
+        var occId = row.dataset.occurrenceId;
+        if (!Object.prototype.hasOwnProperty.call(doneMap, occId)) return;
+        if (doneMap[occId] !== (row.dataset.lastCheckedAt || "")) {
+          delete doneMap[occId];
+          changed = true;
+        }
+      });
     });
     if (changed) saveDoneMap();
   })();
@@ -376,7 +395,10 @@
     if (!doneTbody) return;
     doneTbody.innerHTML = "";
     var pruned = false;
-    var allRows = problemTable ? Array.from(problemTable.querySelectorAll("tr.row[data-occurrence-id]")) : [];
+    var allRows = [problemTable, watchTable].reduce(function (acc, table) {
+      if (table) acc.push.apply(acc, table.querySelectorAll("tr[data-occurrence-id]"));
+      return acc;
+    }, []);
     Object.keys(doneMap).forEach(function (id) {
       var row = allRows.find(function (r) { return r.dataset.occurrenceId === id; });
       if (!row) {
@@ -391,6 +413,13 @@
       var courseCell = document.createElement("td");
       courseCell.textContent = row.dataset.course;
       clone.insertBefore(courseCell, clone.firstChild);
+
+      // The merged done table has a "Next check" column that only watch-sourced rows
+      // carry natively - pad problem-sourced rows with a blank cell in that slot so
+      // both shapes line up under the shared header.
+      if (row.dataset.source === "problem") {
+        clone.insertBefore(document.createElement("td"), clone.lastElementChild);
+      }
 
       var lastCell = clone.lastElementChild;
       lastCell.innerHTML = "";
@@ -416,23 +445,27 @@
       var span = group.querySelector(".group-count");
       if (!span) return;
       var remaining = 0;
-      group.querySelectorAll("tr.row[data-occurrence-id]").forEach(function (row) {
+      group.querySelectorAll("tr[data-occurrence-id]").forEach(function (row) {
         if (!Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) remaining++;
       });
       span.textContent = pluralize(remaining, span.dataset.singular);
     });
 
-    var problemCount = document.getElementById("problem-count");
-    if (problemTable && problemCount) {
-      // problem_links (and this heading) count unique links, not page occurrences -
-      // a link on multiple course pages produces one row per page but must only count once.
-      // A link still counts as outstanding if any of its occurrences hasn't been marked done.
-      var remainingIds = new Set();
-      problemTable.querySelectorAll("tr.row[data-link-id]").forEach(function (row) {
-        if (!Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) remainingIds.add(row.dataset.linkId);
-      });
-      problemCount.textContent = remainingIds.size;
-    }
+    updateUniqueLinkCount(problemTable, "problem-count");
+    updateUniqueLinkCount(watchTable, "watch-count");
+  }
+
+  function updateUniqueLinkCount(table, countElementId) {
+    var countEl = document.getElementById(countElementId);
+    if (!table || !countEl) return;
+    // The heading counts unique links, not page occurrences - a link on multiple
+    // course pages produces one row per page but must only count once. A link still
+    // counts as outstanding if any of its occurrences hasn't been marked done.
+    var remainingIds = new Set();
+    table.querySelectorAll("tr[data-link-id]").forEach(function (row) {
+      if (!Object.prototype.hasOwnProperty.call(doneMap, row.dataset.occurrenceId)) remainingIds.add(row.dataset.linkId);
+    });
+    countEl.textContent = remainingIds.size;
   }
 
   function buildInfoBlurb(row) {
@@ -483,27 +516,28 @@
     }, 1500);
   }
 
-  if (problemTable) {
-    problemTable.addEventListener("click", function (event) {
-      var doneBtn = event.target.closest(".mark-done-btn");
-      if (doneBtn) {
-        var doneRow = doneBtn.closest("tr");
-        doneMap[doneBtn.dataset.occurrenceId] = doneRow.dataset.lastCheckedAt || "";
-        saveDoneMap();
-        refreshVisibility();
-        renderDoneSection();
-        updateGroupCounts();
-        return;
-      }
-      var copyBtn = event.target.closest(".copy-blurb-btn");
-      if (copyBtn) {
-        var row = copyBtn.closest("tr");
-        copyText(buildInfoBlurb(row)).then(function () {
-          showCopiedFeedback(copyBtn);
-        });
-      }
-    });
+  function handleTableClick(event) {
+    var doneBtn = event.target.closest(".mark-done-btn");
+    if (doneBtn) {
+      var doneRow = doneBtn.closest("tr");
+      doneMap[doneBtn.dataset.occurrenceId] = doneRow.dataset.lastCheckedAt || "";
+      saveDoneMap();
+      refreshVisibility();
+      renderDoneSection();
+      updateGroupCounts();
+      return;
+    }
+    var copyBtn = event.target.closest(".copy-blurb-btn");
+    if (copyBtn) {
+      var row = copyBtn.closest("tr");
+      copyText(buildInfoBlurb(row)).then(function () {
+        showCopiedFeedback(copyBtn);
+      });
+    }
   }
+
+  if (problemTable) problemTable.addEventListener("click", handleTableClick);
+  if (watchTable) watchTable.addEventListener("click", handleTableClick);
 
   if (doneTbody) {
     doneTbody.addEventListener("click", function (event) {
