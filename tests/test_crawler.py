@@ -9,6 +9,7 @@ from linkcheck.crawler import (
     CourseLink,
     CoursePage,
     ExtractedLink,
+    _is_stale_read,
     _retry_after_seconds,
     crawl_site,
     discover_course_urls,
@@ -785,3 +786,140 @@ async def test_crawl_site_force_bypasses_the_touch_path():
     assert results[0].unchanged is True  # still accurately reported - modified_gmt really didn't change
     assert results[0].link_count == 0  # re-extraction actually ran and picked up the logic change
     assert conn.execute("SELECT COUNT(*) AS n FROM page_links").fetchone()["n"] == 0
+
+
+# --- stale CDN read guard -------------------------------------------------------
+# Both sites' REST API sits behind the WordPress.com CDN, which caches the per-slug
+# fetch and the listing sweep under separate keys - a `?slug=` body was observed three
+# days stale while the sweep reported the correct current modified_gmt. Extracting from
+# such a body persists an outdated link set while last_crawled_at advances, which is
+# what makes the dashboard say "last scanned course page 3 minutes ago" next to links
+# the author already removed.
+
+
+def test_is_stale_read():
+    assert _is_stale_read("2026-07-21T13:42:10", "2026-07-24T18:54:25") is True  # body older
+    assert _is_stale_read("2026-07-24T18:54:25", "2026-07-24T18:54:25") is False  # in step
+    # edited between sweep and fetch - newer than expected is fine, not a stale read
+    assert _is_stale_read("2026-07-24T19:00:00", "2026-07-24T18:54:25") is False
+    assert _is_stale_read(None, "2026-07-24T18:54:25") is False  # nothing to compare
+    assert _is_stale_read("2026-07-24T18:54:25", None) is False
+
+
+def _seed_page(conn, *, modified_gmt: str, link_url: str):
+    sync_course_page(
+        conn, "homeschool",
+        CoursePage(
+            wp_id=1, slug="ep-math-1", canonical_url="https://allinonehomeschool.com/ep-math-1/",
+            title="Math 1", html="<p>x</p>", modified_gmt=modified_gmt,
+        ),
+        [ExtractedLink(url=link_url, text="a", day_context=None)],
+    )
+
+
+def _stored(conn):
+    row = conn.execute(
+        "SELECT modified_gmt, last_crawled_at FROM pages WHERE slug = 'ep-math-1'"
+    ).fetchone()
+    urls = {
+        r["url"] for r in conn.execute(
+            "SELECT links.url FROM links JOIN page_links ON page_links.link_id = links.id"
+        )
+    }
+    return row, urls
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_refetches_stale_body_and_uses_the_fresh_one():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    _seed_page(conn, modified_gmt="2023-05-26T19:33:31", link_url="https://ext.example.com/old")
+
+    listing = [_listing_entry("ep-math-1", "2024-01-01T00:00:00")]
+    calls = []
+
+    def slug_handler(request):
+        calls.append(request.url.params.get("_cb"))
+        if len(calls) == 1:  # CDN serves a body from before the edit
+            return _page_response(
+                "ep-math-1", wp_id=1, title="Math 1",
+                content='<a href="https://ext.example.com/old">old</a>',
+                modified_gmt="2023-05-26T19:33:31",
+            )
+        return _page_response(
+            "ep-math-1", wp_id=1, title="Math 1",
+            content='<a href="https://ext.example.com/new">new</a>',
+            modified_gmt="2024-01-01T00:00:00",
+        )
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing=listing, slug_handler=slug_handler) as client:
+        await crawl_site(conn, client, _SITE)
+
+    assert len(calls) == 2, "stale body should have triggered exactly one refetch"
+    assert calls[0] != calls[1], "refetch must carry a fresh cache-buster, not repeat the cached URL"
+
+    row, urls = _stored(conn)
+    assert urls == {"https://ext.example.com/new"}  # the edit landed
+    assert row["modified_gmt"] == "2024-01-01T00:00:00"
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_preserves_stored_links_when_body_stays_stale():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    _seed_page(conn, modified_gmt="2023-05-26T19:33:31", link_url="https://ext.example.com/old")
+    before = conn.execute("SELECT last_crawled_at FROM pages WHERE slug='ep-math-1'").fetchone()[0]
+
+    listing = [_listing_entry("ep-math-1", "2024-01-01T00:00:00")]
+    calls = []
+
+    def slug_handler(request):  # stale every time - origin lag, not just the CDN
+        calls.append(request.url.params.get("_cb"))
+        return _page_response(
+            "ep-math-1", wp_id=1, title="Math 1",
+            content='<a href="https://ext.example.com/whatever-stale-said">s</a>',
+            modified_gmt="2023-05-26T19:33:31",
+        )
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing=listing, slug_handler=slug_handler) as client:
+        results = await crawl_site(conn, client, _SITE)
+
+    assert len(calls) == 2  # one refetch, then give up rather than persist known-old data
+
+    row, urls = _stored(conn)
+    # The known-outdated body must not overwrite what's stored...
+    assert urls == {"https://ext.example.com/old"}
+    # ...and last_crawled_at must NOT advance, so the dashboard's "last scanned course
+    # page" stays truthful instead of vouching for a scan that didn't happen.
+    assert row["last_crawled_at"] == before
+    # Still reachable: a transient stale read must never look like a deleted page and
+    # get its links pruned out from under the report.
+    assert results[0].found is True
+    assert conn.execute("SELECT COUNT(*) FROM page_links").fetchone()[0] == 1
+
+
+@pytest.mark.asyncio
+async def test_crawl_site_cache_busts_every_rest_request():
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+    seen = []
+
+    def handler(request):
+        if request.url.path == "/individual-courses-of-study/":
+            return httpx.Response(200, text=_INDEX_HTML)
+        seen.append(request.url.params.get("_cb"))
+        if "slug" in request.url.params:
+            return _page_response(
+                "ep-math-1", wp_id=1, title="Math 1",
+                content='<a href="https://ext.example.com/a">a</a>', modified_gmt="2024-01-01",
+            )
+        return httpx.Response(
+            200, json=[_listing_entry("ep-math-1", "2024-01-01")], headers={"X-WP-TotalPages": "1"}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await crawl_site(conn, client, _SITE)
+
+    assert seen, "expected REST traffic"
+    assert all(cb for cb in seen), "every REST request must carry a cache-buster"
+    assert len(set(seen)) == len(seen), "cache-buster must never repeat across requests"

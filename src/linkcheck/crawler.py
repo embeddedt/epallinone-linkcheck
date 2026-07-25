@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import html
+import itertools
 import logging
+import os
 import random
 import re
 import sqlite3
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -185,6 +188,28 @@ def _slug_from_url(url: str) -> str:
     return url.rstrip("/").rsplit("/", 1)[-1]
 
 
+_cache_bust_counter = itertools.count()
+
+
+def _cache_bust() -> str:
+    """A never-repeating query-param value, to force the REST API's fronting CDN to
+    revalidate against origin instead of serving whatever it has cached.
+
+    Both sites sit behind the WordPress.com CDN, which caches REST responses per
+    distinct URL and has been observed serving a `?slug=` body three days stale while
+    the sparse listing sweep (a different URL, hence a different cache key) returned
+    the correct current modified_gmt. A stale body means links get extracted from an
+    old version of the page, so an edit the user just made appears not to have
+    registered - while `pages.last_crawled_at` still advances, making the dashboard
+    claim the page was just scanned.
+
+    pid + monotonic-ish clock + counter, so the value can't collide with one this or
+    any concurrent process already burned (a repeat would just hit the CDN entry that
+    request populated).
+    """
+    return f"{os.getpid():x}{time.time_ns():x}{next(_cache_bust_counter):x}"
+
+
 async def _fetch_wp_page(
     client: httpx.AsyncClient, site: Site, slug: str, *, fields: str | None = None
 ) -> dict | None:
@@ -196,7 +221,7 @@ async def _fetch_wp_page(
     against both flat slugs (`/ep-math-1/`) and pages nested under the index page
     itself (`/individual-courses-of-study/intermediate-language-arts/`).
     """
-    params = {"slug": slug}
+    params = {"slug": slug, "_cb": _cache_bust()}
     if fields is not None:
         params["_fields"] = fields
     response = await _get_with_retry(client, f"{site.base_url}/wp-json/wp/v2/pages", params=params)
@@ -233,11 +258,16 @@ async def list_all_pages(
     (`rest_post_invalid_page_number`) rather than returning an empty list, so the loop
     is bounded by the `X-WP-TotalPages` response header from the first page instead of
     probing until it fails.
+
+    The sweep is cache-busted (see _cache_bust) like the per-slug fetch: it is the only
+    change signal the crawl has, so a CDN-cached listing would mean an edit is never
+    detected at all - a strictly worse failure than a stale body, and invisible, since
+    every page would just take the "unchanged, touched" path forever.
     """
     response = await _get_with_retry(
         client,
         f"{site.base_url}/wp-json/wp/v2/pages",
-        params={"per_page": per_page, "page": 1, "_fields": PAGE_LIST_FIELDS},
+        params={"per_page": per_page, "page": 1, "_fields": PAGE_LIST_FIELDS, "_cb": _cache_bust()},
     )
     pages = list(response.json())
     total_pages = int(response.headers.get("X-WP-TotalPages", "1"))
@@ -245,7 +275,10 @@ async def list_all_pages(
         response = await _get_with_retry(
             client,
             f"{site.base_url}/wp-json/wp/v2/pages",
-            params={"per_page": per_page, "page": page_num, "_fields": PAGE_LIST_FIELDS},
+            params={
+                "per_page": per_page, "page": page_num,
+                "_fields": PAGE_LIST_FIELDS, "_cb": _cache_bust(),
+            },
         )
         pages.extend(response.json())
     return pages
@@ -671,26 +704,49 @@ def _known_page_state(conn: sqlite3.Connection, site_id: int, slug: str) -> sqli
     ).fetchone()
 
 
+def _stored_page_edges(conn: sqlite3.Connection, page_id: int) -> tuple[int, list[str]]:
+    """A page's external-link count (for the crawl summary) and the internal-link edges
+    persisted by its last real crawl (see sync_course_page) - what lets crawl_site's BFS
+    keep expanding through a page whose body this cycle never fetched.
+    """
+    link_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM page_links WHERE page_id = ?", (page_id,)
+    ).fetchone()["n"]
+    children = [
+        row["child_url"]
+        for row in conn.execute(
+            "SELECT child_url FROM page_internal_links WHERE page_id = ?", (page_id,)
+        )
+    ]
+    return link_count, children
+
+
 def _touch_page_crawled(conn: sqlite3.Connection, page_id: int) -> tuple[int, list[str]]:
     """Record that a page was recrawled and found unchanged (its modified_gmt matched
-    the site-wide listing sweep), without a full fetch or reparse. Returns its current
-    external-link count for the crawl summary, and the internal-link edges persisted
-    from its last real crawl (see sync_course_page) - what lets crawl_site's BFS keep
-    expanding through an unchanged page without paying for its body.
+    the site-wide listing sweep), without a full fetch or reparse.
+
+    Note this advances last_crawled_at - which the dashboard renders as "last scanned
+    course page" - on the strength of modified_gmt alone, without re-reading the body.
+    That is only honest as long as modified_gmt is trusted to move whenever the rendered
+    content does; crawl_site's stale-read guard deliberately does NOT come through here,
+    so a page whose body couldn't be read fresh keeps its older, truthful timestamp.
     """
-    now = _now()
     with conn:
-        conn.execute("UPDATE pages SET last_crawled_at = ? WHERE id = ?", (now, page_id))
-        link_count = conn.execute(
-            "SELECT COUNT(*) AS n FROM page_links WHERE page_id = ?", (page_id,)
-        ).fetchone()["n"]
-        children = [
-            row["child_url"]
-            for row in conn.execute(
-                "SELECT child_url FROM page_internal_links WHERE page_id = ?", (page_id,)
-            )
-        ]
-    return link_count, children
+        conn.execute("UPDATE pages SET last_crawled_at = ? WHERE id = ?", (_now(), page_id))
+        return _stored_page_edges(conn, page_id)
+
+
+def _is_stale_read(fetched_modified_gmt: str | None, listed_modified_gmt: str | None) -> bool:
+    """True when a per-slug fetch came back describing an *older* revision than the
+    listing sweep just reported - i.e. a cached body slipped past the cache-buster.
+
+    Both values are WP's `modified_gmt`: fixed-width UTC ISO-8601 with no offset
+    ('2026-07-24T18:54:25'), so a plain string comparison orders them correctly. Either
+    being absent means there is nothing to compare and nothing to suspect.
+    """
+    if not fetched_modified_gmt or not listed_modified_gmt:
+        return False
+    return fetched_modified_gmt < listed_modified_gmt
 
 
 def _upsert_link(conn: sqlite3.Connection, url: str) -> int:
@@ -986,6 +1042,46 @@ async def crawl_site(
             # the listing said it existed a moment ago - a narrow delete-in-between
             # race, not the common "not a WP page" case; treat the same either way
             return _not_found_result(slug, kind), []
+
+        # A body older than the listing said to expect is a stale read, not an edit:
+        # the fetch and the sweep are separate CDN cache keys, so one can serve days-old
+        # content while the other is current. Extracting from it would persist an
+        # outdated link set - exactly the "I fixed this and it still shows" symptom.
+        # (Strictly *newer* is fine: the page was edited between sweep and fetch.)
+        if _is_stale_read(page.modified_gmt, entry["modified_gmt"]):
+            logger.warning(
+                "%s: %s [%s] stale read - body is modified_gmt=%s but listing said %s; refetching",
+                site.slug, slug, kind, page.modified_gmt, entry["modified_gmt"],
+            )
+            async with semaphore:
+                page = await fetch_page_by_slug(client, site, slug)
+                await asyncio.sleep(request_delay)
+            if page is None:
+                return _not_found_result(slug, kind), []
+
+        if _is_stale_read(page.modified_gmt, entry["modified_gmt"]):
+            # Still stale after a cache-busted refetch - the CDN isn't the whole story
+            # (origin replication lag, most likely). Persisting would overwrite the
+            # stored link set with a known-outdated one *and* advance last_crawled_at,
+            # so the dashboard would claim a fresh scan of stale data. Leave the page
+            # exactly as it is and let the next cycle try again; the listing/stored
+            # mismatch guarantees it gets retried rather than touch-skipped.
+            logger.error(
+                "%s: %s [%s] still stale after refetch (body=%s, listing=%s) - "
+                "keeping stored links, will retry next crawl",
+                site.slug, slug, kind, page.modified_gmt, entry["modified_gmt"],
+            )
+            # A page with no stored state has nothing to preserve and nothing to go
+            # stale, so fall through and take what we got. Otherwise keep it reachable
+            # (so _prune_unreachable_pages doesn't drop its links) and keep the BFS
+            # walking through it, but do NOT advance last_crawled_at.
+            if known is not None:
+                link_count, children = _stored_page_edges(conn, known["id"])
+                reachable_page_ids.add(known["id"])
+                return CrawlResult(
+                    slug=slug, title=None, url=entry["link"], kind=kind,
+                    found=True, link_count=link_count, unchanged=True,
+                ), children
 
         # display-only: a force=True full fetch can still land on an unchanged
         # modified_gmt (re-applying an extraction-logic change, not a real edit) -
