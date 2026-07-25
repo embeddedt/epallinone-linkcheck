@@ -27,6 +27,7 @@ from linkcheck.config import (
     CRAWL_REQUEST_DELAY_SECONDS,
     USER_AGENT,
     Site,
+    blacklisted_page_slugs,
 )
 
 logger = logging.getLogger(__name__)
@@ -905,6 +906,15 @@ async def crawl_site(
     were never visited, so pruning is skipped rather than wrongly treating "not visited
     this run" as "no longer linked."
 
+    A slug in config.blacklisted_page_slugs() (see PageBlacklistRule) is dropped from
+    the frontier outright - never fetched, so its own links and anything reachable only
+    through it never enter the graph at all. A page that's also reachable via some
+    other, non-blacklisted path is unaffected: the blacklist only blocks traversal
+    through the named slug itself, and that other edge still adds the page to the
+    frontier normally. A previously-crawled blacklisted page's stored page_links simply
+    age out via the same _prune_unreachable_pages pass as any other no-longer-reachable
+    page - no separate cleanup needed.
+
     Bounded by a semaphore rather than fetching everything at once - out of politeness
     to the site being crawled. Calling the synchronous sync_course_page() from these
     concurrent coroutines needs no lock - see the shared-connection note in
@@ -929,6 +939,8 @@ async def crawl_site(
     site_id = _get_site_id(conn, site.slug)
     semaphore = asyncio.Semaphore(concurrency)
 
+    blacklisted_slugs = blacklisted_page_slugs()
+    skipped_blacklisted: set[str] = set()
     visited: set[str] = set()
     reachable_page_ids: set[int] = set()
     results: list[CrawlResult] = []
@@ -996,7 +1008,9 @@ async def crawl_site(
 
     depth = 0
     while frontier:
-        todo = [slug for slug in dict.fromkeys(frontier) if slug not in visited]
+        candidates = [slug for slug in dict.fromkeys(frontier) if slug not in visited]
+        todo = [slug for slug in candidates if slug not in blacklisted_slugs]
+        skipped_blacklisted.update(slug for slug in candidates if slug in blacklisted_slugs)
         if not todo:
             break
         if depth > max_depth:
@@ -1023,6 +1037,12 @@ async def crawl_site(
                     next_frontier.append(child_slug)
         frontier = next_frontier
         depth += 1
+
+    if skipped_blacklisted:
+        logger.info(
+            "%s: skipped %d blacklisted page(s), never crawled: %s",
+            site.slug, len(skipped_blacklisted), sorted(skipped_blacklisted),
+        )
 
     if not truncated:
         _prune_unreachable_pages(conn, site_id, reachable_page_ids)

@@ -541,6 +541,68 @@ async def test_crawl_site_prunes_page_links_for_pages_no_longer_reachable():
 
 
 @pytest.mark.asyncio
+async def test_crawl_site_never_fetches_a_blacklisted_slug_and_prunes_its_stale_data(monkeypatch):
+    monkeypatch.setattr(crawler, "blacklisted_page_slugs", lambda: frozenset({"blocked-page"}))
+
+    conn = db.connect(":memory:")
+    db.init_db(conn)
+
+    # Seed state from before the blacklist existed: blocked-page was crawled and has
+    # its own links, plus a child only ever reached through it.
+    blocked_page = CoursePage(
+        wp_id=2, slug="blocked-page", canonical_url="https://allinonehomeschool.com/blocked-page/",
+        title="Blocked", html="<p>x</p>", modified_gmt="2023-01-01",
+    )
+    sync_course_page(
+        conn, "homeschool", blocked_page,
+        [ExtractedLink(url="https://ext.example.com/stale", text="stale", day_context=None)],
+        internal_links=["https://allinonehomeschool.com/blocked-only-child"],
+        kind="other", sort_order=None,
+    )
+    child_page = CoursePage(
+        wp_id=3, slug="blocked-only-child", canonical_url="https://allinonehomeschool.com/blocked-only-child/",
+        title="Blocked child", html="<p>y</p>", modified_gmt="2023-01-01",
+    )
+    sync_course_page(
+        conn, "homeschool", child_page,
+        [ExtractedLink(url="https://ext.example.com/also-stale", text="also stale", day_context=None)],
+        kind="other", sort_order=None,
+    )
+    assert conn.execute("SELECT COUNT(*) AS n FROM page_links").fetchone()["n"] == 2
+
+    # This cycle, ep-math-1 links to both the blacklisted page and a page reachable
+    # some other, legitimate way too - the blacklist must only cut the former.
+    listing = [
+        _listing_entry("ep-math-1", "2023-01-01"),
+        _listing_entry("blocked-page", "2023-01-01"),
+        _listing_entry("shared-page", "2023-01-01"),
+    ]
+
+    def slug_handler(request):
+        slug = request.url.params["slug"]
+        if slug == "ep-math-1":
+            content = (
+                '<a href="https://allinonehomeschool.com/blocked-page/">blocked</a> '
+                '<a href="https://allinonehomeschool.com/shared-page/">shared</a>'
+            )
+            return _page_response(slug, wp_id=1, title="Math 1", content=content, modified_gmt="2023-01-01")
+        if slug == "shared-page":
+            return _page_response(slug, wp_id=4, title="Shared", content="<p>z</p>", modified_gmt="2023-01-01")
+        raise AssertionError(f"blacklisted slug should never be fetched, got slug={slug!r}")
+
+    async with _crawl_client(index_html=_INDEX_HTML, listing=listing, slug_handler=slug_handler) as client:
+        results = await crawl_site(conn, client, _SITE)
+
+    slugs = {r.slug for r in results}
+    assert slugs == {"ep-math-1", "shared-page"}  # blocked-page never even shows up as a result
+
+    # blocked-page's row survives (not hard-deleted)...
+    assert conn.execute("SELECT id FROM pages WHERE slug = 'blocked-page'").fetchone() is not None
+    # ...but its page_links, and its exclusively-reachable child's, are gone.
+    assert conn.execute("SELECT COUNT(*) AS n FROM page_links").fetchone()["n"] == 0
+
+
+@pytest.mark.asyncio
 async def test_crawl_site_skips_pruning_when_limited():
     conn = db.connect(":memory:")
     db.init_db(conn)

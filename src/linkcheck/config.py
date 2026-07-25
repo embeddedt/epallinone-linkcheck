@@ -124,7 +124,38 @@ class LinkTextBlacklistRule:
         )
 
 
-BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule, ...] = (
+@dataclass(frozen=True)
+class PageBlacklistRule:
+    key: str  # slug: namespaces this rule's SQL param names, avoiding collisions
+    label: str  # short display name, for the dashboard
+    reason: str  # human sentence, for the dashboard
+    kind: str  # "page" - display-only, no logic depends on it
+    values: frozenset[str]  # same-site page slugs to never crawl
+
+    def sql_clause(
+        self, *, host_column: str = "host", link_id_column: str = "links.id"
+    ) -> tuple[str, dict[str, str]]:
+        # Enforced at crawl time (crawler.crawl_site never visits these slugs, or
+        # anything reachable only through them - see blacklisted_page_slugs), not by
+        # filtering the check/report queries - once a page is never crawled, its links
+        # never get rows to filter in the first place. Included in BLACKLIST_RULES
+        # anyway (rather than a separate list) purely so it shows up on the dashboard
+        # next to the other "never checked" rules.
+        return "", {}
+
+
+BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule | PageBlacklistRule, ...] = (
+    PageBlacklistRule(
+        key="parent_submitted_pages",
+        label="Parent-submitted course pages",
+        kind="page",
+        values=frozenset({"parent-submitted-courses", "foresensics-parent-submitted"}),
+        reason=(
+            "User-submitted course content, not maintained curriculum - these pages, "
+            "and any page reachable only through them, are never crawled at all. A "
+            "page also reachable via a real course page stays in scope."
+        ),
+    ),
     HostBlacklistRule(
         key="never_check_host",
         label="Never-checked hosts",
@@ -211,6 +242,18 @@ def exclusion_clause(
             fragments.append(fragment)
             params.update(rule_params)
     return "\n          ".join(fragments), params
+
+
+def blacklisted_page_slugs() -> frozenset[str]:
+    """Union of every PageBlacklistRule's slugs in BLACKLIST_RULES - crawler.crawl_site
+    skips these slugs (and anything reachable only through them) entirely via the BFS
+    frontier, rather than via a SQL predicate (see PageBlacklistRule.sql_clause).
+    """
+    slugs: set[str] = set()
+    for rule in BLACKLIST_RULES:
+        if isinstance(rule, PageBlacklistRule):
+            slugs |= rule.values
+    return frozenset(slugs)
 
 # Per-domain concurrency and rate limiting are enforced in SQL against domain_state/
 # domain_claims (see schema.sql, checker.claim_checkable_links) - not in-process
