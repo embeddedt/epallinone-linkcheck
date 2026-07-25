@@ -117,7 +117,9 @@ async def check_loop(
             logger.warning("check failed [%s] %s (status=%s)", outcome, link.url, updated.status)
 
     async with httpx.AsyncClient(
-        timeout=CHECK_TIMEOUT_SECONDS, max_redirects=CHECK_MAX_REDIRECTS
+        timeout=CHECK_TIMEOUT_SECONDS,
+        max_redirects=CHECK_MAX_REDIRECTS,
+        verify=checker.build_check_ssl_context(),
     ) as client:
         pool_task = asyncio.create_task(
             checker.run_continuous_checks(

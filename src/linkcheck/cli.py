@@ -191,7 +191,9 @@ def check_command(db_path: str, batch_size: int) -> None:
 
     async def run() -> None:
         async with httpx.AsyncClient(
-            timeout=CHECK_TIMEOUT_SECONDS, max_redirects=CHECK_MAX_REDIRECTS
+            timeout=CHECK_TIMEOUT_SECONDS,
+            max_redirects=CHECK_MAX_REDIRECTS,
+            verify=checker.build_check_ssl_context(),
         ) as client:
             checked = await checker.check_due_links(
                 conn,

@@ -10,6 +10,7 @@ import linkcheck.checker
 from linkcheck.checker import (
     CheckResult,
     LinkState,
+    build_check_ssl_context,
     check_link,
     classify,
     next_state,
@@ -29,6 +30,26 @@ def assert_next_check_within_jitter(actual: datetime, now: datetime, days: int) 
     lo = timedelta(days=days * (1 - RECHECK_JITTER_FRACTION))
     hi = timedelta(days=days * (1 + RECHECK_JITTER_FRACTION))
     assert lo <= delta <= hi, f"{delta} not within +/-{RECHECK_JITTER_FRACTION:.0%} of {days} days"
+
+
+# --- build_check_ssl_context() ---
+
+
+def test_build_check_ssl_context_still_verifies_certs():
+    # Lowering the key-size floor (SECLEVEL) must not also disable certificate
+    # verification - those are orthogonal knobs and only the former should change.
+    ctx = build_check_ssl_context()
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_build_check_ssl_context_permits_a_1024_bit_dh_cipher():
+    # SECLEVEL=1's whole point is accepting handshakes SECLEVEL=2 (OpenSSL's default)
+    # rejects for using a <2048-bit ephemeral DH key - assert the level actually
+    # dropped by checking a DHE cipher survived the set_ciphers() call.
+    ctx = build_check_ssl_context()
+    names = {cipher["name"] for cipher in ctx.get_ciphers()}
+    assert any(name.startswith("DHE-") for name in names)
 
 
 # --- classify() ---

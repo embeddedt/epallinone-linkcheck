@@ -57,6 +57,19 @@ class CheckResult:
     response_time_ms: int
 
 
+def build_check_ssl_context() -> ssl.SSLContext:
+    """SSL context for the check-phase client. OpenSSL 3.x's default security level
+    (2) requires RSA/DH/DSA keys >=2048 bits, rejecting the handshake outright for
+    legacy-but-still-widely-tolerated servers (e.g. 1024-bit ephemeral DH) that real
+    browsers connect to just fine - browsers never raised their floor that high.
+    SECLEVEL=1 matches that browser floor (>=1024 bits) without going as far as
+    accepting genuinely broken configurations - SSLv3 and null ciphers stay forbidden.
+    """
+    ctx = ssl.create_default_context()
+    ctx.set_ciphers("DEFAULT:@SECLEVEL=1")
+    return ctx
+
+
 def classify(http_status: int | None, error_type: str | None) -> str:
     """Map a raw check outcome to ok | broken | unreachable - the ONLY place "broken"
     is defined (raw outcomes are stored regardless, so extending it later reclassifies
