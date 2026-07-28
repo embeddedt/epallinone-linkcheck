@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS links (
     next_check_at TEXT NOT NULL,           -- due immediately on first insert
     last_http_status INTEGER,
     last_error_type TEXT,
+    last_final_url TEXT,                   -- str(response.url) after redirects, from the
+                                            -- most recent completed check (see checker._fetch)
+    last_broken_reason TEXT,               -- rot.py reason slug (e.g. 'homepage_redirect')
+                                            -- when the most recent check's classify() call
+                                            -- flagged a 2xx as broken anyway; NULL otherwise
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending' -- pending | ok | broken | unreachable
 );
@@ -99,7 +104,15 @@ CREATE TABLE IF NOT EXISTS link_checks (
     http_status INTEGER,
     error_type TEXT,
     response_time_ms INTEGER,
-    classified_broken INTEGER NOT NULL     -- classify() output at check time (0/1)
+    classified_broken INTEGER NOT NULL,    -- classify() output at check time (0/1)
+    final_url TEXT,                        -- str(response.url) after redirects; captured for
+                                            -- every completed response, including a plain 404
+    page_title TEXT,                       -- <title> text from a capped 2xx html body sample
+                                            -- (see checker._read_body_sample); NULL when the
+                                            -- response wasn't a 2xx html page, or had no title
+    broken_reason TEXT                     -- rot.py reason slug when classify() flagged this
+                                            -- check broken via rot detection rather than a
+                                            -- plain 404/410 or network failure; NULL otherwise
 );
 CREATE INDEX IF NOT EXISTS idx_link_checks_link ON link_checks(link_id, checked_at);
 

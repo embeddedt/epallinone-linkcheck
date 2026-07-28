@@ -6,6 +6,7 @@ import asyncio
 import http.client
 import logging
 import random
+import re
 import socket
 import sqlite3
 import ssl
@@ -16,16 +17,20 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 import httpx
+from bs4 import BeautifulSoup
 
-from linkcheck import aia
+from linkcheck import aia, rot
 from linkcheck.config import (
     BROKEN_RECHECK_DAYS,
     CHECK_AIA_CHASE,
+    CHECK_BODY_SAMPLE_BYTES,
     CHECK_HTTPS_UPGRADE,
     CHECK_LENIENT_HTTP_FALLBACK,
     CHECK_MAX_REDIRECTS,
     CHECK_ONESHOT_POLL_SECONDS,
+    CHECK_ROT_DETECTION,
     CHECK_TIMEOUT_SECONDS,
+    CHECK_YOUTUBE_OEMBED,
     HEALTHY_RECHECK_DAYS,
     RECHECK_JITTER_FRACTION,
     UNCONFIRMED_RETRY_MINUTES,
@@ -55,6 +60,16 @@ class CheckResult:
     http_status: int | None
     error_type: str | None
     response_time_ms: int
+    # Captured for every completed response (including a plain 404), regardless of
+    # rot detection being on - a redirect's landing spot is useful context on its
+    # own. Persisted (see record_check); body_excerpt below deliberately is not.
+    final_url: str | None = None
+    page_title: str | None = None
+    # In-memory only - never written to link_checks. It exists purely to feed
+    # rot.detect_rot for this one check; keeping ~4000 chars of page text per row of
+    # an append-only history table would bloat it for no benefit once the check is
+    # over and classified.
+    body_excerpt: str | None = None
 
 
 def build_check_ssl_context() -> ssl.SSLContext:
@@ -70,29 +85,72 @@ def build_check_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
-def classify(http_status: int | None, error_type: str | None) -> str:
-    """Map a raw check outcome to ok | broken | unreachable - the ONLY place "broken"
-    is defined (raw outcomes are stored regardless, so extending it later reclassifies
-    history rather than re-checking).
+@dataclass(frozen=True)
+class Classification:
+    status: str  # ok | broken | unreachable
+    reason: str | None  # rot reason slug (see linkcheck.rot) - None for a plain status outcome
+
+
+def classify(url: str, result: CheckResult) -> Classification:
+    """Map one check's raw outcome to ok | broken | unreachable (+ an optional rot
+    reason slug) - the ONLY place "broken" is defined (raw outcomes are stored
+    regardless, so extending it later reclassifies history rather than re-checking).
 
     404 (Not Found) and 410 (Gone) are the two definitively-dead statuses. 403 and 5xx
     are deliberately left as `ok`: a 403 is very often bot-blocking a URL a student's
     browser reaches fine, and a 5xx is usually a transient server hiccup - flagging
     either here would mostly manufacture false positives.
+
+    A YouTube video url (check_link routes these through the oEmbed endpoint - see
+    rot.youtube_video_id) is checked ahead of both the 403-is-ok default and the
+    plain 404/410 branch: oEmbed's 403 means the video is specifically private
+    (unwatchable, unlike the usual bot-blocking 403), and its 404 deserves the
+    richer video_unavailable reason rather than the bare 404 branch's None.
+
+    Otherwise, a 2xx gets a second look from rot.detect_rot - a response that
+    "succeeded" but landed on a homepage redirect, a parked domain, or a soft-404
+    page is broken in every way that matters to a student clicking the link, even
+    though the server said 200. `url` is the link's original, as stored (never the
+    https-upgraded form check_link may have actually requested) - every rot
+    heuristic compares host/path/query and never scheme, so this makes no
+    difference to the verdict. Skipped entirely for a still-2xx oEmbed-probed video
+    url, since detect_rot's signals (final_url, page_title) describe the oEmbed
+    JSON resource actually fetched, not the watch/short url stored as the link -
+    nothing else stands between that mismatched pair and a heuristic firing on it.
+    """
+    if result.error_type is not None:
+        return Classification(STATUS_UNREACHABLE, None)
+    if CHECK_YOUTUBE_OEMBED and rot.is_unavailable_video(url, result.http_status):
+        return Classification(STATUS_BROKEN, rot.REASON_VIDEO_UNAVAILABLE)
+    if result.http_status in (404, 410):
+        return Classification(STATUS_BROKEN, None)
+    if CHECK_YOUTUBE_OEMBED and rot.youtube_video_id(url) is not None:
+        return Classification(STATUS_OK, None)
+    if CHECK_ROT_DETECTION:
+        reason = rot.detect_rot(
+            url=url,
+            final_url=result.final_url,
+            http_status=result.http_status,
+            page_title=result.page_title,
+            body_excerpt=result.body_excerpt,
+        )
+        if reason is not None:
+            return Classification(STATUS_BROKEN, reason)
+    return Classification(STATUS_OK, None)
+
+
+def outcome(http_status: int | None, error_type: str | None, broken_reason: str | None) -> str:
+    """One-token, human-facing summary of a raw check outcome: the error type if the
+    request failed at the network level; the rot reason slug if a 2xx was flagged as
+    broken anyway (e.g. "homepage_redirect" - more meaningful than the bare "200"
+    that triggered it); otherwise the HTTP status code. Shared by the CLI, the
+    worker log line, and the reports so they all spell it the same way.
     """
     if error_type is not None:
-        return STATUS_UNREACHABLE
-    if http_status in (404, 410):
-        return STATUS_BROKEN
-    return STATUS_OK
-
-
-def outcome(http_status: int | None, error_type: str | None) -> str:
-    """One-token, human-facing summary of a raw check outcome: the error type if the
-    request failed at the network level, otherwise the HTTP status code. Shared by the
-    CLI, the worker log line, and the reports so they all spell it the same way.
-    """
-    return error_type if error_type is not None else str(http_status)
+        return error_type
+    if broken_reason is not None:
+        return broken_reason
+    return str(http_status)
 
 
 def _classify_connect_error(exc: BaseException) -> str:
@@ -119,6 +177,97 @@ def _classify_connect_error(exc: BaseException) -> str:
             return ERROR_CONNECTION_REFUSED
         cause = cause.__cause__ or cause.__context__
     return ERROR_OTHER
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+MAX_TITLE_CHARS = 300
+MAX_BODY_EXCERPT_CHARS = 4000
+
+
+def _extract_title_and_excerpt(html_sample: str) -> tuple[str | None, str | None]:
+    """One BeautifulSoup parse producing both rot.py signals together, rather than
+    a regex scan for <title> plus a separate soup pass for body text.
+
+    A regex title scan (the previous approach) reads whatever text sits between the
+    first "<title" and "</title>" it finds, with no notion of document structure -
+    so it happily matched a <title> string sitting inside a <script> block (common
+    in SPA boilerplate that sets document.title via a template literal), inside an
+    HTML comment, or inside inline SVG (which has its own <title> element for
+    tooltip text, nothing to do with the page's own title). Any of those could hand
+    soft_404/media_replaced a title that describes the wrong thing entirely.
+    Decomposing script/style/svg/template/noscript before reading soup.title rules
+    all of that out structurally instead of trying to pattern-match around it.
+
+    The title is then removed (the whole <head>, or failing that just the <title>
+    tag) before extracting body text, so the excerpt is genuinely body-only - left
+    in place, the title's own words would leak into the excerpt and get
+    double-counted in parking()'s title+body haystack.
+    """
+    soup = BeautifulSoup(html_sample, "lxml")
+    for tag in soup(["script", "style", "svg", "template", "noscript"]):
+        tag.decompose()
+
+    title = None
+    title_tag = soup.title
+    if title_tag is not None:
+        # bs4 already unescapes entities in .get_text(), unlike the raw regex match
+        # group the old implementation had to html.unescape() itself.
+        title_text = _WHITESPACE_RE.sub(" ", title_tag.get_text()).strip()
+        title = title_text[:MAX_TITLE_CHARS] or None
+
+    if title_tag is not None:
+        title_tag.decompose()
+    if soup.head is not None:
+        soup.head.decompose()
+
+    excerpt_text = _WHITESPACE_RE.sub(" ", soup.get_text(separator=" ")).strip().lower()
+    excerpt = excerpt_text[:MAX_BODY_EXCERPT_CHARS] or None
+    return title, excerpt
+
+
+async def _read_body_sample(response: httpx.Response) -> str | None:
+    """Up to CHECK_BODY_SAMPLE_BYTES of a 2xx html response, decoded best-effort -
+    None for anything else (rot detection never runs on a non-2xx or non-html
+    response anyway, so there's no signal worth the read).
+    """
+    if not (200 <= response.status_code < 300):
+        return None
+    if "html" not in response.headers.get("content-type", "").lower():
+        return None
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        chunks.append(chunk)
+        total += len(chunk)
+        if total >= CHECK_BODY_SAMPLE_BYTES:
+            break
+    raw = b"".join(chunks)[:CHECK_BODY_SAMPLE_BYTES]
+    if not raw:
+        return None
+    # httpx's charset_normalizer autodetection (via .encoding) needs the whole body
+    # to sniff from, which a partial/capped read never has - the header-declared
+    # charset (or utf-8) is good enough for phrase-matching purposes.
+    return raw.decode(response.encoding or "utf-8", errors="replace")
+
+
+async def _result_from_response(response: httpx.Response, response_time_ms: int) -> CheckResult:
+    """Build a CheckResult from a completed httpx response, sampling its body when
+    there's one worth reading (see _read_body_sample). Shared by the plain fetch
+    path and the AIA-chase retry path so a rot verdict never depends on which one
+    happened to complete the request.
+    """
+    body_sample = await _read_body_sample(response)
+    title, excerpt = _extract_title_and_excerpt(body_sample) if body_sample else (None, None)
+    return CheckResult(
+        response.status_code,
+        None,
+        response_time_ms,
+        final_url=str(response.url),
+        page_title=title,
+        body_excerpt=excerpt,
+    )
 
 
 def _aia_retry_client(ctx: ssl.SSLContext) -> httpx.AsyncClient:
@@ -148,20 +297,43 @@ async def _fetch_via_aia_chase(url: str) -> CheckResult | None:
             async with retry_client.stream(
                 "GET", url, headers={"User-Agent": USER_AGENT}, follow_redirects=True
             ) as response:
-                return CheckResult(
-                    response.status_code, None, int((time.monotonic() - start) * 1000)
-                )
+                return await _result_from_response(response, int((time.monotonic() - start) * 1000))
     except httpx.RequestError:
         return None
 
 
-def _lenient_get(url: str, timeout: float) -> int:
+@dataclass(frozen=True)
+class _LenientResult:
+    status: int
+    final_url: str
+    page_title: str | None
+    body_excerpt: str | None
+
+
+def _read_lenient_body_sample(response: http.client.HTTPResponse) -> str | None:
+    """http.client-side counterpart to _read_body_sample - same status/content-type
+    gate and byte cap, same header-charset-or-utf-8 decoding fallback, just reading
+    via the blocking .read(cap) this connection type exposes instead of an async
+    iterator.
+    """
+    if not (200 <= response.status < 300):
+        return None
+    if "html" not in (response.getheader("Content-Type") or "").lower():
+        return None
+    raw = response.read(CHECK_BODY_SAMPLE_BYTES)
+    if not raw:
+        return None
+    charset = response.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, errors="replace")
+
+
+def _lenient_get(url: str, timeout: float) -> _LenientResult:
     """Blocking GET via stdlib http.client, whose header parsing (built on
     email.parser) accepts lines that violate RFC 7230 grammar instead of aborting
     like h11 does - split out so tests can monkeypatch the connection classes
     instead of hitting real sockets. Follows redirects itself (http.client doesn't)
-    up to CHECK_MAX_REDIRECTS hops, and never reads the response body since only the
-    status is needed.
+    up to CHECK_MAX_REDIRECTS hops, so the returned final_url is always this
+    function's own doing, not something the caller has to chase separately.
     """
     for _ in range(CHECK_MAX_REDIRECTS + 1):
         parsed = urllib.parse.urlsplit(url)
@@ -179,10 +351,18 @@ def _lenient_get(url: str, timeout: float) -> int:
                 location = response.getheader("Location")
                 response.close()
                 if not location:
-                    return response.status
+                    return _LenientResult(response.status, url, None, None)
                 url = urllib.parse.urljoin(url, location)
                 continue
-            return response.status
+            body_sample = _read_lenient_body_sample(response)
+            response.close()
+            title, excerpt = _extract_title_and_excerpt(body_sample) if body_sample else (None, None)
+            return _LenientResult(
+                response.status,
+                url,
+                title,
+                excerpt,
+            )
         finally:
             conn.close()
     raise RuntimeError(f"too many redirects: {url}")
@@ -197,15 +377,24 @@ async def _fetch_via_lenient_http_client(url: str) -> CheckResult | None:
     """
     start = time.monotonic()
     try:
-        status = await asyncio.to_thread(_lenient_get, url, CHECK_TIMEOUT_SECONDS)
+        result = await asyncio.to_thread(_lenient_get, url, CHECK_TIMEOUT_SECONDS)
     except Exception:
         return None
-    return CheckResult(status, None, int((time.monotonic() - start) * 1000))
+    return CheckResult(
+        result.status,
+        None,
+        int((time.monotonic() - start) * 1000),
+        final_url=result.final_url,
+        page_title=result.page_title,
+        body_excerpt=result.body_excerpt,
+    )
 
 
 async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
-    """One GET attempt against url. Streams the response and closes after headers -
-    never downloads the full body, since we only care about the status code.
+    """One GET attempt against url. Streams the response, reading only a capped
+    sample of a 2xx html body (see _read_body_sample) rather than downloading the
+    whole thing - just enough to feed rot detection without paying for a full
+    fetch of every page checked.
     """
     start = time.monotonic()
 
@@ -216,7 +405,7 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
         async with client.stream(
             "GET", url, headers={"User-Agent": USER_AGENT}, follow_redirects=True
         ) as response:
-            return CheckResult(response.status_code, None, elapsed_ms())
+            return await _result_from_response(response, elapsed_ms())
     except httpx.TooManyRedirects:
         return CheckResult(None, ERROR_TOO_MANY_REDIRECTS, elapsed_ms())
     except httpx.TimeoutException:
@@ -248,6 +437,15 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
         return CheckResult(None, ERROR_OTHER, elapsed_ms())
 
 
+def _youtube_oembed_url(video_id: str) -> str:
+    """The official oEmbed probe URL for one YouTube video - see check_link for why
+    this is fetched instead of the video's own watch/short URL.
+    """
+    watch_url = f"https://www.youtube.com/watch?v={video_id}"
+    query = urllib.parse.urlencode({"url": watch_url, "format": "json"})
+    return f"https://www.youtube.com/oembed?{query}"
+
+
 async def check_link(client: httpx.AsyncClient, url: str) -> CheckResult:
     """Check a single URL, mirroring the HTTPS-upgrade behavior every major browser now
     defaults to (Firefox's HTTPS-First since v136, Chrome's "Always Use Secure
@@ -261,7 +459,21 @@ async def check_link(client: httpx.AsyncClient, url: str) -> CheckResult:
     page and never sees the failure.
 
     Governed by config.CHECK_HTTPS_UPGRADE - off checks every URL exactly as stored.
+
+    A youtube.com/watch or youtu.be url (rot.youtube_video_id returns an id for
+    those - anything else, e.g. a playlist or channel url, falls through below) is
+    fetched via the oEmbed endpoint instead of a direct GET, since YouTube serves an
+    empty JS shell to a non-browser client regardless of whether the video is up -
+    see config.CHECK_YOUTUBE_OEMBED and checker.classify. The returned CheckResult's
+    final_url is honestly the oEmbed probe url actually requested, not the original
+    watch url - it never redirects in practice, and this is the raw record of what
+    was fetched either way.
     """
+    if CHECK_YOUTUBE_OEMBED:
+        video_id = rot.youtube_video_id(url)
+        if video_id is not None:
+            return await _fetch(client, _youtube_oembed_url(video_id))
+
     if not CHECK_HTTPS_UPGRADE or not url.startswith("http://"):
         return await _fetch(client, url)
 
@@ -292,16 +504,20 @@ class UpdatedLinkState:
     next_check_at: datetime
 
 
-def next_state(previous: LinkState, result: CheckResult, now: datetime) -> UpdatedLinkState:
+def next_state(previous: LinkState, classification: Classification, now: datetime) -> UpdatedLinkState:
     """Confirm-before-flagging backoff: a link only flips to broken/unreachable after
     UNCONFIRMED_RETRY_MINUTES worth of consecutive failures, ruling out a transient
     blip. Once confirmed, it settles into a slower steady-state recheck - no need to
     hammer something already known to be down, just periodically confirm it's still
     down (or that it's recovered).
-    """
-    classification = classify(result.http_status, result.error_type)
 
-    if classification == STATUS_OK:
+    Takes the already-computed Classification rather than a raw CheckResult - the
+    caller (record_check) needs classify()'s result anyway to persist
+    classified_broken/broken_reason, so this avoids classifying the same check twice.
+    A rot verdict goes through exactly the same retry/confirm machinery as a plain
+    404 here - nothing about rot detection bypasses confirm-before-flagging.
+    """
+    if classification.status == STATUS_OK:
         return UpdatedLinkState(
             status=STATUS_OK,
             consecutive_failures=0,
@@ -321,7 +537,7 @@ def next_state(previous: LinkState, result: CheckResult, now: datetime) -> Updat
     # read as "confirmed" (>= threshold), and an unbounded counter would skew the
     # consecutive_failures-DESC report ordering by mere age rather than severity.
     return UpdatedLinkState(
-        status=classification,
+        status=classification.status,
         consecutive_failures=min(failures, len(UNCONFIRMED_RETRY_MINUTES) + 1),
         next_check_at=now + _jittered_days(BROKEN_RECHECK_DAYS),
     )
@@ -590,18 +806,24 @@ def release_claim(conn: sqlite3.Connection, link_id: int) -> None:
 def record_check(
     conn: sqlite3.Connection, link: DueLink, result: CheckResult, now: datetime
 ) -> UpdatedLinkState:
-    classification = classify(result.http_status, result.error_type)
+    # Classified once here and threaded into next_state, rather than each computing
+    # its own classify() call - classified_broken/broken_reason below must record
+    # what classify() said about THIS check regardless of whether next_state's
+    # confirm-before-flagging counter has actually flipped the link's status yet.
+    classification = classify(link.url, result)
     updated = next_state(
         LinkState(status=link.status, consecutive_failures=link.consecutive_failures),
-        result,
+        classification,
         now,
     )
     with conn:
         conn.execute(
             """
             INSERT INTO link_checks
-                (link_id, checked_at, http_status, error_type, response_time_ms, classified_broken)
-            VALUES (:link_id, :checked_at, :http_status, :error_type, :response_time_ms, :classified_broken)
+                (link_id, checked_at, http_status, error_type, response_time_ms,
+                 classified_broken, final_url, page_title, broken_reason)
+            VALUES (:link_id, :checked_at, :http_status, :error_type, :response_time_ms,
+                    :classified_broken, :final_url, :page_title, :broken_reason)
             """,
             {
                 "link_id": link.id,
@@ -609,7 +831,10 @@ def record_check(
                 "http_status": result.http_status,
                 "error_type": result.error_type,
                 "response_time_ms": result.response_time_ms,
-                "classified_broken": 1 if classification == STATUS_BROKEN else 0,
+                "classified_broken": 1 if classification.status == STATUS_BROKEN else 0,
+                "final_url": result.final_url,
+                "page_title": result.page_title,
+                "broken_reason": classification.reason,
             },
         )
         conn.execute(
@@ -619,6 +844,8 @@ def record_check(
                 next_check_at = :next_check_at,
                 last_http_status = :http_status,
                 last_error_type = :error_type,
+                last_final_url = :final_url,
+                last_broken_reason = :broken_reason,
                 consecutive_failures = :consecutive_failures,
                 status = :status
             WHERE id = :id
@@ -628,6 +855,8 @@ def record_check(
                 "next_check_at": updated.next_check_at.isoformat(),
                 "http_status": result.http_status,
                 "error_type": result.error_type,
+                "final_url": result.final_url,
+                "broken_reason": classification.reason,
                 "consecutive_failures": updated.consecutive_failures,
                 "status": updated.status,
                 "id": link.id,

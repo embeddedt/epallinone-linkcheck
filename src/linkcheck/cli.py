@@ -184,9 +184,10 @@ def check_command(db_path: str, batch_size: int) -> None:
     conn = db.connect(db_path)
 
     def on_result(link, result, updated) -> None:
-        if checker.classify(result.http_status, result.error_type) == checker.STATUS_OK:
+        classification = checker.classify(link.url, result)
+        if classification.status == checker.STATUS_OK:
             return
-        outcome = checker.outcome(result.http_status, result.error_type)
+        outcome = checker.outcome(result.http_status, result.error_type, classification.reason)
         click.echo(f"  [{updated.status:>11}] {outcome:>5} {link.url}")
 
     async def run() -> None:

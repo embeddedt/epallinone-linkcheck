@@ -43,10 +43,23 @@ next due, on its own per-link schedule. They never block each other.
   every `<a href>` in the body, best-effort `day_context` from nearest `id="dayN"`),
   upsert/diff into `pages`/`links`/`page_links`.
 - `checker.py` — streaming `GET` (never `HEAD` — many sites handle it inconsistently) with
-  redirects followed; `classify(http_status, error_type) -> ok | broken | unreachable` is
-  the single pure function that decides what counts as broken (raw outcomes are always
-  logged, so redefining "broken" later means editing this function and reclassifying
-  history, never re-checking); backoff/`next_check_at` scheduling.
+  redirects followed, reading a capped sample of 2xx HTML bodies for rot signals (final
+  URL, `<title>`, visible-text excerpt); `classify(url, result) -> Classification` is
+  the single pure function that decides what counts as broken (raw outcomes — including
+  `final_url`/`page_title` — are always logged, so redefining "broken" later means
+  editing this function and reclassifying history, never re-checking);
+  backoff/`next_check_at` scheduling.
+- `rot.py` — "webpage rot" heuristics for 200s that are effectively dead, consulted by
+  `classify`: `homepage_redirect` (deep link landed on a bare homepage), `soft_404`
+  (page titles/describes itself as not-found/suspended), `parking` (known parking
+  hosts or unambiguous domain-for-sale phrases). Pure functions over plain strings, so
+  they can be tuned offline against captured sweep data (fetch every link once, dump
+  url/final_url/title/excerpt to JSONL, re-run `detect_rot` over it after each tweak —
+  never re-fetch per tweak). Precision over recall throughout: phrase/host lists are
+  deliberately conservative, and every heuristic was validated against a full live
+  sweep of all ~22k tracked links before being enabled. A rot verdict flows through
+  the same confirm-before-flagging machinery as a 404 and is recorded per-check as
+  `broken_reason` (surfaced by reports in place of the bare "200").
 - `scheduler.py` — the `run` worker: crawl loop (daily) + check loop (short interval)
   running together as independent asyncio loops in one process; regenerates the HTML
   dashboard at the end of each check cycle.

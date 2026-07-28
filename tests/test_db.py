@@ -210,6 +210,70 @@ def test_init_db_migrates_page_links_primary_key_to_support_multiple_occurrences
     assert count == 2
 
 
+def test_init_db_migrates_existing_links_and_link_checks_tables_missing_rot_columns():
+    # simulates a DB created before rot detection existed - link_checks lacked
+    # final_url/page_title/broken_reason and links lacked last_final_url/
+    # last_broken_reason
+    conn = db.connect(":memory:")
+    conn.executescript("""
+        CREATE TABLE pages (
+            id INTEGER PRIMARY KEY,
+            site_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            title TEXT,
+            last_crawled_at TEXT,
+            UNIQUE(site_id, url)
+        );
+        CREATE TABLE links (
+            id INTEGER PRIMARY KEY,
+            url TEXT UNIQUE NOT NULL,
+            host TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            last_checked_at TEXT,
+            next_check_at TEXT NOT NULL,
+            last_http_status INTEGER,
+            last_error_type TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending'
+        );
+        CREATE TABLE link_checks (
+            id INTEGER PRIMARY KEY,
+            link_id INTEGER NOT NULL REFERENCES links(id),
+            checked_at TEXT NOT NULL,
+            http_status INTEGER,
+            error_type TEXT,
+            response_time_ms INTEGER,
+            classified_broken INTEGER NOT NULL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO links (id, url, host, first_seen_at, next_check_at, last_http_status) "
+        "VALUES (1, 'https://ext.example.com/a', 'ext.example.com', "
+        "'2026-01-01T00:00:00', '2026-01-01T00:00:00', 200)"
+    )
+    conn.execute(
+        "INSERT INTO link_checks (link_id, checked_at, http_status, classified_broken) "
+        "VALUES (1, '2026-01-01T00:00:00', 200, 0)"
+    )
+    conn.commit()
+
+    db.init_db(conn)
+
+    links_columns = {row["name"] for row in conn.execute("PRAGMA table_info(links)")}
+    assert {"last_final_url", "last_broken_reason"} <= links_columns
+    link_checks_columns = {row["name"] for row in conn.execute("PRAGMA table_info(link_checks)")}
+    assert {"final_url", "page_title", "broken_reason"} <= link_checks_columns
+
+    link_row = conn.execute("SELECT * FROM links WHERE id = 1").fetchone()
+    assert link_row["last_http_status"] == 200  # pre-existing data survives the migration
+    assert link_row["last_final_url"] is None
+
+    check_row = conn.execute("SELECT * FROM link_checks WHERE link_id = 1").fetchone()
+    assert check_row["http_status"] == 200  # pre-existing data survives the migration
+    assert check_row["broken_reason"] is None
+
+
 def test_init_db_page_links_migration_is_idempotent():
     conn = db.connect(":memory:")
     db.init_db(conn)

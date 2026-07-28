@@ -268,6 +268,32 @@ CHECK_PER_DOMAIN_MIN_INTERVAL_SECONDS = 0.5  # min spacing between request *star
 CHECK_TIMEOUT_SECONDS = 15
 CHECK_MAX_REDIRECTS = 10
 
+# Extended "webpage rot" detection (parked domains, soft-404 pages, redirects
+# dumped on a bare homepage) beyond the plain 404/410 definition of broken - see
+# linkcheck.rot. Off falls back to classifying only on http_status/error_type, with
+# no other behavior change: final_url/page_title are still captured and persisted
+# either way (see CheckResult) - only the heuristic checks themselves are skipped.
+CHECK_ROT_DETECTION = True
+
+# YouTube serves an empty JS shell to any non-browser client (including this
+# checker's plain GET) regardless of whether the video is up - a deleted or private
+# video still 200s with no title/body signal to catch it on (all 148 YouTube links
+# in the validation sweep had empty titles). The official oEmbed endpoint is probed
+# instead for youtube.com/watch and youtu.be URLs (see rot.youtube_video_id/
+# is_unavailable_video, checker.check_link): 200 means the video exists, 401 means
+# embedding is disabled but the video is still watchable on youtube.com itself (NOT
+# broken - left `ok`), 403 means the video is private (unwatchable), 404 means it's
+# deleted. Off falls back to fetching the original URL directly, with no oEmbed
+# probe and no video_unavailable reason ever applying.
+CHECK_YOUTUBE_OEMBED = True
+
+# Cap on how much of a 2xx html response body gets read for rot-detection signals
+# (title text, a visible-body excerpt) - stopped early once this many bytes are in,
+# not sized to capture a whole page. A soft-404/parking lander's telltale phrases
+# are always near the top of the document, so there's nothing to gain from reading
+# further at the cost of a slower, heavier check on every single link.
+CHECK_BODY_SAMPLE_BYTES = 65536
+
 # Every major browser now defaults to trying https:// before a literal http:// request,
 # falling back to http only on a connection-level failure (see notes.md). Mirroring that
 # means checking http:// links the way a real visitor's browser actually resolves them

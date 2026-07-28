@@ -121,6 +121,42 @@ def test_record_check_writes_history_and_updates_link_state(conn):
     assert history[0]["response_time_ms"] == 42
 
 
+def test_record_check_persists_final_url_and_page_title(conn):
+    seed_link(conn)
+    now = datetime.now(UTC)
+    link = get_due_links(conn, now, batch_size=10)[0]
+
+    result = CheckResult(200, None, 10, final_url="https://ext.example.com/final", page_title="A Page")
+    record_check(conn, link, result, now)
+
+    row = conn.execute("SELECT * FROM links WHERE id = ?", (link.id,)).fetchone()
+    assert row["last_final_url"] == "https://ext.example.com/final"
+    assert row["last_broken_reason"] is None  # plain 200, nothing flagged
+
+    history = conn.execute("SELECT * FROM link_checks WHERE link_id = ?", (link.id,)).fetchone()
+    assert history["final_url"] == "https://ext.example.com/final"
+    assert history["page_title"] == "A Page"
+    assert history["broken_reason"] is None
+
+
+def test_record_check_persists_broken_reason_from_rot_detection(conn):
+    seed_link(conn, url="https://ext.example.com/deep/lesson")
+    now = datetime.now(UTC)
+    link = get_due_links(conn, now, batch_size=10)[0]
+
+    # a 200 whose every redirect lands on the bare homepage - classify() should flag
+    # this via rot.detect_rot even though http_status itself is a plain 200
+    result = CheckResult(200, None, 10, final_url="https://ext.example.com/")
+    record_check(conn, link, result, now)
+
+    history = conn.execute("SELECT * FROM link_checks WHERE link_id = ?", (link.id,)).fetchone()
+    assert history["classified_broken"] == 1
+    assert history["broken_reason"] == "homepage_redirect"
+
+    row = conn.execute("SELECT * FROM links WHERE id = ?", (link.id,)).fetchone()
+    assert row["last_broken_reason"] == "homepage_redirect"
+
+
 def test_record_check_confirms_broken_after_enough_failures(conn):
     seed_link(conn)
     now = datetime.now(UTC)

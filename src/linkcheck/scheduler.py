@@ -112,8 +112,9 @@ async def check_loop(
         stats["checked"] += 1
         if updated.status != "ok":
             stats["not_ok"] += 1
-        if checker.classify(result.http_status, result.error_type) != checker.STATUS_OK:
-            outcome = checker.outcome(result.http_status, result.error_type)
+        classification = checker.classify(link.url, result)
+        if classification.status != checker.STATUS_OK:
+            outcome = checker.outcome(result.http_status, result.error_type, classification.reason)
             logger.warning("check failed [%s] %s (status=%s)", outcome, link.url, updated.status)
 
     async with httpx.AsyncClient(

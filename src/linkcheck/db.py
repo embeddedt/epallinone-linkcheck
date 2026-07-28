@@ -39,6 +39,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     # under this scheme" and get one real recrawl rather than being trusted as having
     # zero children. See crawler._known_page_state/crawl_site.
     _add_column_if_missing(conn, "pages", "internal_links_synced_at", "TEXT")
+    _add_column_if_missing(conn, "link_checks", "final_url", "TEXT")
+    _add_column_if_missing(conn, "link_checks", "page_title", "TEXT")
+    _add_column_if_missing(conn, "link_checks", "broken_reason", "TEXT")
+    _add_column_if_missing(conn, "links", "last_final_url", "TEXT")
+    _add_column_if_missing(conn, "links", "last_broken_reason", "TEXT")
     _migrate_page_links_occurrences(conn, schema)
     _sync_sites(conn)
     conn.commit()

@@ -295,6 +295,34 @@ def test_render_text_report_lists_problems(conn):
     assert "broken" in text
 
 
+def test_render_text_report_shows_broken_reason_as_outcome_token(conn):
+    # a rot-flagged link's outcome token should read as its reason slug (e.g.
+    # "homepage_redirect"), not the bare "200" that triggered it
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/deep/lesson", text="a", day_context="day3")],
+    )
+    _confirm_broken(conn, CheckResult(200, None, 10, final_url="https://ext.example.com/"))
+
+    text = report.render_text_report(
+        report.get_site_summaries(conn), report.get_problem_links(conn), report.get_watch_links(conn)
+    )
+    assert "homepage_redirect" in text
+    problem_links = report.get_problem_links(conn)
+    assert problem_links[0].last_broken_reason == "homepage_redirect"
+
+
+def test_render_html_report_shows_broken_reason_as_outcome_token(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/deep/lesson", text="a", day_context=None)],
+    )
+    _confirm_broken(conn, CheckResult(200, None, 10, final_url="https://ext.example.com/"))
+
+    html = report.render_html_report(report.get_problem_links(conn), report.get_watch_links(conn))
+    assert "homepage_redirect" in html
+
+
 def test_render_text_report_lists_watching(conn):
     _sync(
         conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",

@@ -8,6 +8,7 @@ import pytest
 
 import linkcheck.checker
 from linkcheck.checker import (
+    Classification,
     CheckResult,
     LinkState,
     build_check_ssl_context,
@@ -55,28 +56,123 @@ def test_build_check_ssl_context_permits_a_1024_bit_dh_cipher():
 # --- classify() ---
 
 
+def _result(http_status, error_type=None, **kwargs):
+    return CheckResult(http_status, error_type, 10, **kwargs)
+
+
 def test_classify_404_is_broken():
-    assert classify(404, None) == "broken"
+    assert classify("https://x.test/a", _result(404)) == Classification("broken", None)
 
 
 def test_classify_410_gone_is_broken():
-    assert classify(410, None) == "broken"
+    assert classify("https://x.test/a", _result(410)) == Classification("broken", None)
 
 
 def test_classify_200_is_ok():
-    assert classify(200, None) == "ok"
+    assert classify("https://x.test/a", _result(200)) == Classification("ok", None)
 
 
 def test_classify_other_error_status_is_ok_for_now():
     # 404 and 410 are the only broken statuses today; 403 (often bot-blocking) and 5xx
     # (often transient) are deliberately left ok - this is what changes if the
     # definition of "broken" is extended later
-    assert classify(500, None) == "ok"
-    assert classify(403, None) == "ok"
+    assert classify("https://x.test/a", _result(500)) == Classification("ok", None)
+    assert classify("https://x.test/a", _result(403)) == Classification("ok", None)
 
 
 def test_classify_network_error_is_unreachable_regardless_of_status():
-    assert classify(None, "timeout") == "unreachable"
+    assert classify("https://x.test/a", _result(None, "timeout")) == Classification(
+        "unreachable", None
+    )
+
+
+# --- classify() rot detection (see test_rot.py for the heuristics themselves) ---
+
+
+def test_classify_200_with_rot_signal_is_broken_with_reason():
+    # a homepage-redirect verdict on an otherwise-200 response - the exact
+    # heuristics are covered in test_rot.py, this just checks classify() wires
+    # rot.detect_rot's verdict into a Classification correctly
+    result = _result(200, final_url="https://x.test/")
+    assert classify("https://x.test/deep/lesson", result) == Classification(
+        "broken", "homepage_redirect"
+    )
+
+
+def test_classify_skips_rot_detection_when_disabled(monkeypatch):
+    monkeypatch.setattr(linkcheck.checker, "CHECK_ROT_DETECTION", False)
+    result = _result(200, final_url="https://x.test/")
+    assert classify("https://x.test/deep/lesson", result) == Classification("ok", None)
+
+
+# --- classify() YouTube oEmbed video-unavailable check ---
+
+
+def test_classify_youtube_403_is_broken_as_video_unavailable():
+    # a bare 403 is normally left ok (see test_classify_other_error_status_is_ok_for_now)
+    # - for a YouTube video url specifically it means "private video", not bot-blocking
+    result = _result(403)
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "broken", "video_unavailable"
+    )
+
+
+def test_classify_youtube_404_gets_the_richer_video_unavailable_reason():
+    # still broken either way, but the video-specific reason wins over the plain
+    # 404 branch's bare None reason
+    result = _result(404)
+    assert classify("https://youtu.be/dQw4w9WgXcQ", result) == Classification(
+        "broken", "video_unavailable"
+    )
+
+
+def test_classify_youtube_401_stays_ok():
+    # embedding disabled, not unwatchable - a real visitor can still watch it on
+    # youtube.com itself
+    result = _result(401)
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "ok", None
+    )
+
+
+def test_classify_non_youtube_404_is_unaffected():
+    result = _result(404)
+    assert classify("https://example.com/video", result) == Classification("broken", None)
+
+
+def test_classify_skips_youtube_oembed_check_when_disabled(monkeypatch):
+    monkeypatch.setattr(linkcheck.checker, "CHECK_YOUTUBE_OEMBED", False)
+    result = _result(403)
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "ok", None
+    )
+
+
+def test_classify_skips_rot_detection_for_oembed_probed_video():
+    # a 2xx oEmbed probe's final_url/title describe the oEmbed JSON resource, not
+    # the watch url stored as the link - detect_rot must never run against that
+    # mismatched pair. page_title is deliberately set to something that WOULD trip
+    # soft_404 (a title-only heuristic, so the mismatched final_url doesn't matter
+    # here) if detect_rot ran, proving the skip actually happens rather than just
+    # coincidentally not firing.
+    result = _result(
+        200,
+        final_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        page_title="Page Not Found",
+    )
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "ok", None
+    )
+
+
+def test_classify_runs_rot_detection_for_youtube_url_when_oembed_disabled(monkeypatch):
+    # with oEmbed routing off, a youtube url is fetched like any other page, so its
+    # own rot signals ARE meaningful and detect_rot must still run
+    monkeypatch.setattr(linkcheck.checker, "CHECK_YOUTUBE_OEMBED", False)
+    result = _result(200, final_url="https://www.youtube.com/")
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "broken", "homepage_redirect"
+    )
 
 
 # --- next_state() backoff ---
@@ -86,7 +182,7 @@ def test_next_state_healthy_resets_failures_and_sets_long_recheck():
     now = datetime(2026, 1, 1, tzinfo=UTC)
     updated = next_state(
         LinkState(status="broken", consecutive_failures=1),
-        CheckResult(200, None, 10),
+        Classification("ok", None),
         now,
     )
     assert updated.status == "ok"
@@ -98,7 +194,7 @@ def test_next_state_first_failure_is_unconfirmed():
     now = datetime(2026, 1, 1, tzinfo=UTC)
     updated = next_state(
         LinkState(status="ok", consecutive_failures=0),
-        CheckResult(404, None, 10),
+        Classification("broken", None),
         now,
     )
     assert updated.status == "ok"  # not flipped yet
@@ -111,7 +207,7 @@ def test_next_state_confirms_after_enough_consecutive_failures():
     failures_before_confirm = len(UNCONFIRMED_RETRY_MINUTES)
     updated = next_state(
         LinkState(status="ok", consecutive_failures=failures_before_confirm),
-        CheckResult(404, None, 10),
+        Classification("broken", None),
         now,
     )
     assert updated.status == "broken"
@@ -126,7 +222,7 @@ def test_next_state_confirmed_failure_count_is_clamped_at_threshold():
     confirmed = len(UNCONFIRMED_RETRY_MINUTES) + 1
     updated = next_state(
         LinkState(status="broken", consecutive_failures=confirmed + 5),
-        CheckResult(404, None, 10),
+        Classification("broken", None),
         now,
     )
     assert updated.status == "broken"
@@ -137,7 +233,7 @@ def test_next_state_second_unconfirmed_failure_uses_the_second_retry_interval():
     now = datetime(2026, 1, 1, tzinfo=UTC)
     updated = next_state(
         LinkState(status="ok", consecutive_failures=1),
-        CheckResult(404, None, 10),
+        Classification("broken", None),
         now,
     )
     assert updated.status == "ok"  # still within the retry window, not confirmed
@@ -149,7 +245,7 @@ def test_next_state_confirms_unreachable_on_persistent_network_failure():
     now = datetime(2026, 1, 1, tzinfo=UTC)
     updated = next_state(
         LinkState(status="ok", consecutive_failures=len(UNCONFIRMED_RETRY_MINUTES)),
-        CheckResult(None, "timeout", 10),
+        Classification("unreachable", None),
         now,
     )
     # network-level failure confirms as unreachable, kept distinct from broken
@@ -157,11 +253,26 @@ def test_next_state_confirms_unreachable_on_persistent_network_failure():
     assert_next_check_within_jitter(updated.next_check_at, now, BROKEN_RECHECK_DAYS)
 
 
+def test_next_state_confirmed_broken_carries_the_rot_reason_into_status():
+    # next_state itself doesn't touch broken_reason (that's persisted separately by
+    # record_check) but the confirmed status must still be "broken" for a rot
+    # verdict, exactly as for a plain 404 - confirm-before-flagging doesn't
+    # distinguish between them.
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    failures_before_confirm = len(UNCONFIRMED_RETRY_MINUTES)
+    updated = next_state(
+        LinkState(status="ok", consecutive_failures=failures_before_confirm),
+        Classification("broken", "homepage_redirect"),
+        now,
+    )
+    assert updated.status == "broken"
+
+
 def test_next_state_single_bad_check_does_not_immediately_flip_a_healthy_link():
     now = datetime(2026, 1, 1, tzinfo=UTC)
     updated = next_state(
         LinkState(status="ok", consecutive_failures=0),
-        CheckResult(None, "timeout", 10),
+        Classification("unreachable", None),
         now,
     )
     assert updated.status == "ok"
@@ -350,13 +461,18 @@ def _bad_header_handler(request):
 
 @pytest.mark.asyncio
 async def test_check_link_recovers_via_lenient_http_client_when_retry_succeeds(monkeypatch):
-    monkeypatch.setattr(linkcheck.checker, "_lenient_get", lambda url, timeout: 200)
+    monkeypatch.setattr(
+        linkcheck.checker,
+        "_lenient_get",
+        lambda url, timeout: linkcheck.checker._LenientResult(200, url, None, None),
+    )
 
     async with _client(_bad_header_handler) as client:
         result = await check_link(client, "https://x.test/bad-header")
 
     assert result.http_status == 200
     assert result.error_type is None
+    assert result.final_url == "https://x.test/bad-header"
 
 
 @pytest.mark.asyncio
@@ -388,13 +504,35 @@ async def test_check_link_skips_lenient_fallback_entirely_when_disabled(monkeypa
     assert result.error_type == "other"
 
 
+class _FakeEmailHeaders:
+    """Minimal stand-in for http.client.HTTPResponse.headers (an email.message.Message)
+    - _read_lenient_body_sample only ever calls get_content_charset() on it."""
+
+    def __init__(self, content_type: str):
+        self._content_type = content_type
+
+    def get_content_charset(self):
+        if "charset=" in self._content_type:
+            return self._content_type.split("charset=")[-1].strip()
+        return None
+
+
 class _FakeHttpResponse:
-    def __init__(self, status, headers=None):
+    def __init__(self, status, headers=None, body=b""):
         self.status = status
         self._headers = headers or {}
+        self._body = body
+        self.headers = _FakeEmailHeaders(self._headers.get("Content-Type", ""))
 
     def getheader(self, name):
         return self._headers.get(name)
+
+    def read(self, amt=None):
+        if amt is None:
+            data, self._body = self._body, b""
+        else:
+            data, self._body = self._body[:amt], self._body[amt:]
+        return data
 
     def close(self):
         pass
@@ -429,9 +567,10 @@ def test_lenient_get_follows_redirects_and_returns_final_status(monkeypatch):
     ]
     monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHttpConnection)
 
-    status = linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
+    result = linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
 
-    assert status == 200
+    assert result.status == 200
+    assert result.final_url == "https://x.test/next"
     assert _FakeHttpConnection.calls == ["x.test/start", "x.test/next"]
 
 
@@ -444,6 +583,38 @@ def test_lenient_get_gives_up_after_too_many_redirects(monkeypatch):
 
     with pytest.raises(RuntimeError):
         linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
+
+
+def test_lenient_get_reads_capped_html_body_and_extracts_title_and_excerpt(monkeypatch):
+    _FakeHttpConnection.calls = []
+    _FakeHttpConnection.responses = [
+        _FakeHttpResponse(
+            200,
+            {"Content-Type": "text/html; charset=utf-8"},
+            body=b"<html><head><title>Page Not Found</title></head>"
+            b"<body><script>ignored()</script><p>Sorry, nothing here.</p></body></html>",
+        ),
+    ]
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHttpConnection)
+
+    result = linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
+
+    assert result.page_title == "Page Not Found"
+    assert "sorry, nothing here" in result.body_excerpt
+    assert "ignored()" not in result.body_excerpt
+
+
+def test_lenient_get_skips_body_sample_for_non_html_content_type(monkeypatch):
+    _FakeHttpConnection.calls = []
+    _FakeHttpConnection.responses = [
+        _FakeHttpResponse(200, {"Content-Type": "application/pdf"}, body=b"%PDF-1.4 ..."),
+    ]
+    monkeypatch.setattr(http.client, "HTTPSConnection", _FakeHttpConnection)
+
+    result = linkcheck.checker._lenient_get("https://x.test/start", timeout=5)
+
+    assert result.page_title is None
+    assert result.body_excerpt is None
 
 
 @pytest.mark.asyncio
@@ -539,3 +710,282 @@ async def test_check_link_upgrade_disabled_checks_http_url_as_is(monkeypatch):
         result = await check_link(client, "http://x.test/plain")
     assert seen_urls == ["http://x.test/plain"]
     assert result.http_status == 404
+
+
+# --- final_url / page_title / body_excerpt capture (_fetch / check_link) ---
+
+
+@pytest.mark.asyncio
+async def test_check_link_captures_final_url_and_title_after_redirect():
+    def handler(request):
+        if request.url.path == "/start":
+            return httpx.Response(301, headers={"location": "/final"})
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html><head><title>Final Page</title></head></html>",
+        )
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://x.test/start")
+
+    assert result.final_url == "https://x.test/final"
+    assert result.page_title == "Final Page"
+
+
+@pytest.mark.asyncio
+async def test_check_link_captures_final_url_even_on_404():
+    # final_url is captured for every completed response, not just 2xx - useful
+    # context on its own, and rot detection's own guard (see rot.detect_rot) is
+    # what actually keeps it from being misused on a non-2xx status
+    async with _client(lambda request: httpx.Response(404)) as client:
+        result = await check_link(client, "https://x.test/missing")
+
+    assert result.final_url == "https://x.test/missing"
+    assert result.page_title is None
+
+
+@pytest.mark.asyncio
+async def test_check_link_extracts_body_excerpt_for_html_response():
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html"},
+            content=b"<html><body><script>evil()</script><p>Hello World</p></body></html>",
+        )
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://x.test/page")
+
+    assert "hello world" in result.body_excerpt
+    assert "evil" not in result.body_excerpt
+
+
+@pytest.mark.asyncio
+async def test_check_link_skips_body_sample_for_non_html_content_type():
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "application/pdf"}, content=b"%PDF fake")
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://x.test/file.pdf")
+
+    assert result.page_title is None
+    assert result.body_excerpt is None
+
+
+# --- check_link() YouTube oEmbed routing ---
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_watch_url_hits_oembed_endpoint():
+    seen_urls = []
+
+    def handler(request):
+        seen_urls.append(str(request.url))
+        return httpx.Response(200, json={"title": "Some Video"})
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert len(seen_urls) == 1
+    assert seen_urls[0].startswith("https://www.youtube.com/oembed?")
+    assert "url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ" in seen_urls[0]
+    assert "format=json" in seen_urls[0]
+    assert result.http_status == 200
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_short_url_hits_oembed_endpoint():
+    seen_urls = []
+
+    def handler(request):
+        seen_urls.append(str(request.url))
+        return httpx.Response(200, json={"title": "Some Video"})
+
+    async with _client(handler) as client:
+        await check_link(client, "https://youtu.be/dQw4w9WgXcQ")
+
+    assert seen_urls[0].startswith("https://www.youtube.com/oembed?")
+    assert "url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ" in seen_urls[0]
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_v_not_first_query_param_hits_oembed_endpoint():
+    seen_urls = []
+
+    def handler(request):
+        seen_urls.append(str(request.url))
+        return httpx.Response(200, json={"title": "Some Video"})
+
+    async with _client(handler) as client:
+        await check_link(client, "https://www.youtube.com/watch?list=PL123&v=dQw4w9WgXcQ")
+
+    assert "url=https%3A%2F%2Fwww.youtube.com%2Fwatch%3Fv%3DdQw4w9WgXcQ" in seen_urls[0]
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_oembed_401_leaves_status_401_and_classifies_ok():
+    def handler(request):
+        return httpx.Response(401)
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert result.http_status == 401
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "ok", None
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_oembed_403_classifies_broken_video_unavailable():
+    def handler(request):
+        return httpx.Response(403)
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert classify("https://www.youtube.com/watch?v=dQw4w9WgXcQ", result) == Classification(
+        "broken", "video_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_oembed_404_classifies_broken_video_unavailable():
+    def handler(request):
+        return httpx.Response(404)
+
+    async with _client(handler) as client:
+        result = await check_link(client, "https://youtu.be/dQw4w9WgXcQ")
+
+    assert classify("https://youtu.be/dQw4w9WgXcQ", result) == Classification(
+        "broken", "video_unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_check_link_youtube_playlist_url_falls_through_to_normal_fetch():
+    seen_urls = []
+
+    def handler(request):
+        seen_urls.append(str(request.url))
+        return httpx.Response(200)
+
+    async with _client(handler) as client:
+        await check_link(client, "https://www.youtube.com/playlist?list=PL123")
+
+    assert seen_urls == ["https://www.youtube.com/playlist?list=PL123"]
+
+
+@pytest.mark.asyncio
+async def test_check_link_skips_oembed_routing_when_disabled(monkeypatch):
+    monkeypatch.setattr(linkcheck.checker, "CHECK_YOUTUBE_OEMBED", False)
+    seen_urls = []
+
+    def handler(request):
+        seen_urls.append(str(request.url))
+        return httpx.Response(200)
+
+    async with _client(handler) as client:
+        await check_link(client, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    assert seen_urls == ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]
+
+
+# --- _read_body_sample() / _extract_title_and_excerpt() ---
+
+
+@pytest.mark.asyncio
+async def test_read_body_sample_caps_bytes_read(monkeypatch):
+    monkeypatch.setattr(linkcheck.checker, "CHECK_BODY_SAMPLE_BYTES", 10)
+    response = httpx.Response(200, headers={"content-type": "text/html"}, content=b"0123456789ABCDEFGHIJ")
+
+    sample = await linkcheck.checker._read_body_sample(response)
+
+    assert sample == "0123456789"
+
+
+@pytest.mark.asyncio
+async def test_read_body_sample_skips_non_2xx_status():
+    response = httpx.Response(404, headers={"content-type": "text/html"}, content=b"<html></html>")
+    assert await linkcheck.checker._read_body_sample(response) is None
+
+
+@pytest.mark.asyncio
+async def test_read_body_sample_skips_non_html_content_type():
+    response = httpx.Response(200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.4")
+    assert await linkcheck.checker._read_body_sample(response) is None
+
+
+def test_extract_title_strips_whitespace_and_unescapes_entities():
+    html_sample = "<html><head><title>  Hello &amp;  World  </title></head></html>"
+    title, _ = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert title == "Hello & World"
+
+
+def test_extract_title_none_when_missing():
+    title, _ = linkcheck.checker._extract_title_and_excerpt("<html><body>no title here</body></html>")
+    assert title is None
+
+
+def test_extract_title_caps_length():
+    long_title = "x" * 1000
+    html_sample = f"<html><title>{long_title}</title></html>"
+    title, _ = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert len(title) == linkcheck.checker.MAX_TITLE_CHARS
+
+
+def test_extract_title_ignores_title_tag_inside_script(monkeypatch):
+    # a regex-based <title> scan (the old implementation) matches this literally -
+    # a real FP vector for SPA boilerplate that sets document.title via a template
+    # literal containing the string "<title>...</title>"
+    html_sample = (
+        "<html><head>"
+        '<script>var x = "<title>Fake Script Title</title>";</script>'
+        "<title>Real Page Title</title>"
+        "</head><body><p>Hello World</p></body></html>"
+    )
+    title, excerpt = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert title == "Real Page Title"
+    assert "fake script title" not in (excerpt or "")
+
+
+def test_extract_title_ignores_title_tag_inside_svg():
+    # an inline SVG's own <title> is tooltip text for the graphic, not the page's
+    # title - must not be picked up when there's no real <title> in <head>
+    html_sample = (
+        "<html><head></head><body>"
+        "<svg><title>Icon description</title><rect/></svg>"
+        "<p>Hello World</p>"
+        "</body></html>"
+    )
+    title, excerpt = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert title is None
+    assert "icon description" not in (excerpt or "")
+
+
+def test_extract_title_does_not_leak_into_body_excerpt():
+    # the title's own words must not be double-counted in the body excerpt (e.g.
+    # parking()'s title+body haystack)
+    html_sample = "<html><head><title>Page Not Found</title></head><body><p>Sorry, nothing here.</p></body></html>"
+    title, excerpt = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert title == "Page Not Found"
+    assert "page not found" not in excerpt
+    assert "sorry, nothing here" in excerpt
+
+
+def test_extract_body_excerpt_strips_script_and_style_and_lowercases():
+    html_sample = (
+        "<html><head><style>.a{color:red}</style></head>"
+        "<body><script>evil()</script><p>Hello World</p></body></html>"
+    )
+    _, excerpt = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert "hello world" in excerpt
+    assert "evil" not in excerpt
+    assert "color" not in excerpt
+
+
+def test_extract_body_excerpt_caps_length():
+    html_sample = f"<html><body>{'x' * 10000}</body></html>"
+    _, excerpt = linkcheck.checker._extract_title_and_excerpt(html_sample)
+    assert len(excerpt) == linkcheck.checker.MAX_BODY_EXCERPT_CHARS

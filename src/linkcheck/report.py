@@ -29,7 +29,7 @@ def _named_in(prefix: str, values: tuple[str, ...]) -> tuple[str, dict[str, str]
 
 
 _LINK_COLUMNS = """
-    id, url, host, status, last_http_status, last_error_type,
+    id, url, host, status, last_http_status, last_error_type, last_broken_reason,
     consecutive_failures, last_checked_at, first_seen_at, next_check_at,
     (SELECT sites.slug || ': ' || pages.title
      FROM page_links
@@ -67,6 +67,7 @@ class LinkReportRow:
     status: str
     last_http_status: int | None
     last_error_type: str | None
+    last_broken_reason: str | None
     consecutive_failures: int
     last_checked_at: str | None
     first_seen_at: str
@@ -313,6 +314,7 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
             status=row["status"],
             last_http_status=row["last_http_status"],
             last_error_type=row["last_error_type"],
+            last_broken_reason=row["last_broken_reason"],
             consecutive_failures=row["consecutive_failures"],
             last_checked_at=row["last_checked_at"],
             first_seen_at=row["first_seen_at"],
@@ -417,7 +419,7 @@ def get_watch_links(conn: sqlite3.Connection) -> list[LinkReportRow]:
 
 
 def _outcome(link: LinkReportRow) -> str:
-    return checker.outcome(link.last_http_status, link.last_error_type)
+    return checker.outcome(link.last_http_status, link.last_error_type, link.last_broken_reason)
 
 
 def _link_text_display(page) -> str:
