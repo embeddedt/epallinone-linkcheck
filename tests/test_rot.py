@@ -261,9 +261,10 @@ def test_soft_404_default_web_site_page_title():
     assert rot.soft_404(_URL, None, "Default Web Site Page", None) is True
 
 
-def test_soft_404_directory_listing_title():
-    # a bare directory listing where a page used to be (biblehub.com/childrens/)
-    assert rot.soft_404("https://biblehub.com/childrens/", None, "Index of /childrens", None) is True
+def test_soft_404_directory_listing_title_is_not_flagged():
+    # A bare directory listing can be legitimate, intentional content (biblehub.com/
+    # childrens/ serves one on purpose) - too ambiguous to treat as rot on title alone.
+    assert rot.soft_404("https://biblehub.com/childrens/", None, "Index of /childrens", None) is False
 
 
 def test_soft_404_prefix_does_not_match_unrelated_title_mentioning_index():

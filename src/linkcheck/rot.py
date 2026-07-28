@@ -299,15 +299,19 @@ SOFT_404_EXACT_TITLES = frozenset({"404", "not found", "error"})
 # app-specific returning its own 404. Prefix (not substring) match: these are the
 # opening words of the stock title these servers/panels ship with, so a prefix is
 # both sufficient and specific enough not to false-positive on unrelated content.
-# "index of /" also catches a bare Apache/nginx directory listing standing in for a
-# page that used to be there (e.g. biblehub.com/childrens/ -> "Index of /childrens").
+#
+# A bare Apache/nginx directory listing ("Index of /...") deliberately isn't included
+# here even though it can stand in for a page that used to be there - unlike the
+# fixed server-brand titles below, a directory listing is also legitimate, intentional
+# content some sites serve on purpose (e.g. biblehub.com/childrens/, the case that
+# originally motivated adding this, turned out to be exactly that) - too ambiguous to
+# treat as rot on title text alone.
 SOFT_404_TITLE_PREFIXES = (
     "welcome to nginx",
     "apache2 ubuntu default",
     "apache http server test page",
     "iis windows server",
     "default web site page",
-    "index of /",
 )
 
 # A redirect that lands on a URL whose path is itself an error-page slug - the
