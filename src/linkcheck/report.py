@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
 from urllib.parse import quote
 
 from jinja2 import Environment, PackageLoader, select_autoescape
@@ -327,35 +328,43 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
 
 @dataclass(frozen=True)
 class CheckProgress:
-    checked: int
+    up_to_date: int
     total: int
 
     @property
     def pct(self) -> float:
-        return 100.0 * self.checked / self.total if self.total else 0.0
+        return 100.0 * self.up_to_date / self.total if self.total else 0.0
 
 
-def get_check_progress(conn: sqlite3.Connection) -> CheckProgress:
-    """How many checkable links have been checked at least once, out of the total.
+def get_check_progress(conn: sqlite3.Connection, now: datetime) -> CheckProgress:
+    """How many checkable links are NOT currently due for a check, out of the total.
 
     Scoped to the same population claim_checkable_links draws from (referenced from
     at least one page, not matching any config.BLACKLIST_RULES rule) - an orphaned or
     blacklisted link never gets checked again, so counting it would keep the
     percentage from ever reaching 100.
+
+    Deliberately "not due" rather than "checked at least once ever": the latter only
+    ever increases and pins at 100% forever once the initial backlog is drained, which
+    reads as stale/wrong once rechecks resume in steady state. "Not due" tracks the
+    live backlog instead - it dips whenever a cohort of links comes due together (e.g.
+    the same recheck cadence, or a crawl finding new links) and climbs back up as they
+    get checked, so it stays a meaningful sign of life indefinitely, not just during
+    cold start.
     """
     exclude_clause, exclude_params = exclusion_clause("host", "links.id")
     row = conn.execute(
         f"""
         SELECT
             COUNT(*) AS total,
-            SUM(CASE WHEN last_checked_at IS NOT NULL THEN 1 ELSE 0 END) AS checked
+            SUM(CASE WHEN next_check_at > :now THEN 1 ELSE 0 END) AS up_to_date
         FROM links
         WHERE EXISTS (SELECT 1 FROM page_links WHERE page_links.link_id = links.id)
           {exclude_clause}
         """,
-        exclude_params,
+        {"now": now.isoformat(), **exclude_params},
     ).fetchone()
-    return CheckProgress(checked=row["checked"] or 0, total=row["total"] or 0)
+    return CheckProgress(up_to_date=row["up_to_date"] or 0, total=row["total"] or 0)
 
 
 def _link_rows(

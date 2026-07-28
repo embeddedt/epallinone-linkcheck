@@ -7,6 +7,7 @@ import logging
 import os
 import signal
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -161,18 +162,19 @@ async def check_loop(
 
 
 async def progress_loop(conn: sqlite3.Connection, stop_event: asyncio.Event) -> None:
-    """Log the fraction of checkable links checked at least once, on its own fixed
-    cadence - independent of check_loop's batch/dashboard timing, so there's a visible
-    sign of life (and an ETA-able trend) even while a big backlog drains.
+    """Log the fraction of checkable links not currently due for a check, on its own
+    fixed cadence - independent of check_loop's batch/dashboard timing, so there's a
+    visible sign of life (and an ETA-able trend) both while a big backlog drains and
+    afterward in steady state (see get_check_progress).
     """
     while not stop_event.is_set():
         await _sleep_or_stop(stop_event, CHECK_PROGRESS_LOG_SECONDS)
         if stop_event.is_set():
             break
-        progress = report.get_check_progress(conn)
+        progress = report.get_check_progress(conn, datetime.now(UTC))
         logger.info(
-            "Progress: %d/%d links checked (%.1f%%)",
-            progress.checked,
+            "Progress: %d/%d links up to date (%.1f%%)",
+            progress.up_to_date,
             progress.total,
             progress.pct,
         )

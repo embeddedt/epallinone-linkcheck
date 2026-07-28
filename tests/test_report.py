@@ -232,7 +232,7 @@ def test_get_site_summaries_watching_count(conn):
     assert summaries[("homeschool", "course")].pending == 1  # still counted under its real status too
 
 
-def test_get_check_progress_counts_checked_vs_total(conn):
+def test_get_check_progress_counts_up_to_date_vs_total(conn):
     _sync(
         conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
         [
@@ -244,12 +244,27 @@ def test_get_check_progress_counts_checked_vs_total(conn):
     due = get_due_links(conn, now, batch_size=1000)
     checked_link = next(link for link in due if link.url.endswith("/checked"))
     record_check(conn, checked_link, CheckResult(200, None, 10), now)
-    # leave /pending untouched
+    # leave /pending untouched, still due
 
-    progress = report.get_check_progress(conn)
-    assert progress.checked == 1
+    progress = report.get_check_progress(conn, now)
+    assert progress.up_to_date == 1
     assert progress.total == 2
     assert progress.pct == 50.0
+
+
+def test_get_check_progress_drops_when_a_checked_link_comes_due_again(conn):
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/checked", text="a", day_context=None)],
+    )
+    now = datetime.now(UTC)
+    due = get_due_links(conn, now, batch_size=1000)
+    checked_link = next(link for link in due if link.url.endswith("/checked"))
+    record_check(conn, checked_link, CheckResult(200, None, 10), now)
+    assert report.get_check_progress(conn, now).up_to_date == 1  # not due yet
+
+    later = now + timedelta(days=30)  # past HEALTHY_RECHECK_DAYS
+    assert report.get_check_progress(conn, later).up_to_date == 0  # due again - progress reflects it
 
 
 def test_get_check_progress_excludes_orphaned_links(conn):
@@ -261,7 +276,7 @@ def test_get_check_progress_excludes_orphaned_links(conn):
     conn.execute("DELETE FROM page_links WHERE link_id = ?", (link_id,))
     conn.commit()
 
-    progress = report.get_check_progress(conn)
+    progress = report.get_check_progress(conn, datetime.now(UTC))
     assert progress.total == 0  # orphaned link isn't part of the checkable population
     assert progress.pct == 0.0  # no division by zero
 
