@@ -125,6 +125,28 @@ class LinkTextBlacklistRule:
 
 
 @dataclass(frozen=True)
+class LinkUrlBlacklistRule:
+    key: str  # slug: namespaces this rule's SQL param names, avoiding collisions
+    label: str  # short display name, for the dashboard
+    reason: str  # human sentence, for the dashboard
+    kind: str  # "url" - display-only
+    values: frozenset[str]  # exact link URLs to exclude
+
+    def sql_clause(
+        self, *, host_column: str = "host", link_id_column: str = "links.id"
+    ) -> tuple[str, dict[str, str]]:
+        if not self.values:
+            return "", {}
+        params = {f"{self.key}_{i}": v for i, v in enumerate(self.values)}
+        placeholders = ",".join(f":{name}" for name in params)
+        # Hardcoded "links.url" rather than a host_column-style parameter: every
+        # BLACKLIST_RULES query keeps the links table under that literal name (never
+        # aliased away - see link_id_column's own default), and "url" alone would be
+        # ambiguous against pages.url wherever a query also joins pages.
+        return f"AND links.url NOT IN ({placeholders})", params
+
+
+@dataclass(frozen=True)
 class PageBlacklistRule:
     key: str  # slug: namespaces this rule's SQL param names, avoiding collisions
     label: str  # short display name, for the dashboard
@@ -144,7 +166,9 @@ class PageBlacklistRule:
         return "", {}
 
 
-BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule | PageBlacklistRule, ...] = (
+BLACKLIST_RULES: tuple[
+    HostBlacklistRule | LinkTextBlacklistRule | PageBlacklistRule | LinkUrlBlacklistRule, ...
+] = (
     PageBlacklistRule(
         key="parent_submitted_pages",
         label="Parent-submitted course pages",
@@ -165,6 +189,29 @@ BLACKLIST_RULES: tuple[HostBlacklistRule | LinkTextBlacklistRule | PageBlacklist
             "Chronically slow/timeout-prone; each attempt burns the full request "
             "timeout for no benefit. Still crawled and stored, just never due for a "
             "check."
+        ),
+    ),
+    HostBlacklistRule(
+        key="login_required_host",
+        label="Login-required hosts",
+        kind="host",
+        values=frozenset({"www.timetoast.com"}),
+        reason=(
+            "Requires a logged-in session to view a timeline - every check hits an "
+            "auth wall regardless of whether the linked timeline still exists, so a "
+            "check response here is never meaningful."
+        ),
+    ),
+    LinkUrlBlacklistRule(
+        key="rot_false_positive",
+        label="Rot false positives",
+        kind="url",
+        values=frozenset({"https://adblockplus.org/en/chrome"}),
+        reason=(
+            "Confirmed by hand to redirect somewhere still useful - the "
+            "homepage_redirect heuristic (rot.py) flags it anyway, so it's excluded "
+            "individually rather than tuning the heuristic and risking new false "
+            "negatives elsewhere."
         ),
     ),
     LinkTextBlacklistRule(
