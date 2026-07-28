@@ -238,6 +238,39 @@ def requeue_broken_command(db_path: str) -> None:
         conn.close()
 
 
+@main.command("confirm-broken")
+@click.option(
+    "--db-path",
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the SQLite database file.",
+)
+def confirm_broken_command(db_path: str) -> None:
+    """Bump consecutive_failures to the confirm threshold for any link already marked
+    broken/unreachable but stuck below it (e.g. from before UNCONFIRMED_RETRY_MINUTES
+    was lengthened) - a single DB update, not a recheck.
+    """
+    conn = db.connect(db_path)
+    try:
+        threshold = len(checker.UNCONFIRMED_RETRY_MINUTES) + 1
+        cursor = conn.execute(
+            """
+            UPDATE links
+            SET consecutive_failures = :threshold
+            WHERE status IN (:broken, :unreachable) AND consecutive_failures < :threshold
+            """,
+            {
+                "threshold": threshold,
+                "broken": checker.STATUS_BROKEN,
+                "unreachable": checker.STATUS_UNREACHABLE,
+            },
+        )
+        conn.commit()
+        click.echo(f"Bumped consecutive_failures to {threshold} for {cursor.rowcount} links")
+    finally:
+        conn.close()
+
+
 @main.command("report")
 @click.option(
     "--db-path",
