@@ -238,6 +238,28 @@ def requeue_broken_command(db_path: str) -> None:
         conn.close()
 
 
+@main.command("requeue-ok")
+@click.option(
+    "--db-path",
+    default=DEFAULT_DB_PATH,
+    show_default=True,
+    help="Path to the SQLite database file.",
+)
+def requeue_ok_command(db_path: str) -> None:
+    """Pull next_check_at forward to now for every ok link.
+
+    Use this to re-verify the healthy backlog sooner than HEALTHY_RECHECK_DAYS (e.g.
+    after adding/tuning a rot heuristic) instead of waiting for each link's existing
+    schedule to catch up on its own.
+    """
+    conn = db.connect(db_path)
+    try:
+        count = checker.pull_forward_ok_links(conn, datetime.now(UTC))
+        click.echo(f"Requeued {count} ok links for immediate recheck")
+    finally:
+        conn.close()
+
+
 @main.command("confirm-broken")
 @click.option(
     "--db-path",

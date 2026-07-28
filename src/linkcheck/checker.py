@@ -596,6 +596,21 @@ def pull_forward_broken_links(conn: sqlite3.Connection, now: datetime) -> int:
     return cursor.rowcount
 
 
+def pull_forward_ok_links(conn: sqlite3.Connection, now: datetime) -> int:
+    """Set next_check_at to now for every ok link that isn't already due, so the next
+    check cycle reconsiders all of them immediately instead of waiting out
+    HEALTHY_RECHECK_DAYS (e.g. after a crawl adds/changes rot heuristics and you want
+    the whole healthy backlog re-verified against them). Returns the number of links
+    pulled forward.
+    """
+    with conn:
+        cursor = conn.execute(
+            "UPDATE links SET next_check_at = :now WHERE status = :ok AND next_check_at > :now",
+            {"now": now.isoformat(), "ok": STATUS_OK},
+        )
+    return cursor.rowcount
+
+
 @dataclass(frozen=True)
 class AdmissionControl:
     """Per-domain admission-control tuning, always applied together (see

@@ -10,6 +10,7 @@ from linkcheck.checker import (
     claim_checkable_links,
     get_due_links,
     pull_forward_broken_links,
+    pull_forward_ok_links,
     record_check,
     release_claim,
 )
@@ -219,6 +220,39 @@ def test_pull_forward_broken_links_does_not_recount_already_due_links(conn):
     assert count == 0  # already due, nothing to pull forward
 
     row = conn.execute("SELECT next_check_at FROM links WHERE id = ?", (broken_id,)).fetchone()
+    assert row["next_check_at"] == past  # left alone
+
+
+# --- pull_forward_ok_links() ---
+
+
+def test_pull_forward_ok_links_pulls_forward_only_ok_links(conn):
+    ok_id = seed_link(conn, url="https://ext.example.com/ok")
+    broken_id = seed_link(conn, url="https://ext.example.com/broken")
+    future = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+    conn.execute("UPDATE links SET status = 'ok', next_check_at = ? WHERE id = ?", (future, ok_id))
+    conn.execute("UPDATE links SET status = 'broken', next_check_at = ? WHERE id = ?", (future, broken_id))
+    conn.commit()
+
+    now = datetime.now(UTC)
+    count = pull_forward_ok_links(conn, now)
+    assert count == 1
+
+    rows = {row["id"]: row["next_check_at"] for row in conn.execute("SELECT id, next_check_at FROM links")}
+    assert rows[ok_id] == now.isoformat()
+    assert rows[broken_id] == future  # untouched - not ok
+
+
+def test_pull_forward_ok_links_does_not_recount_already_due_links(conn):
+    ok_id = seed_link(conn, url="https://ext.example.com/ok")
+    past = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    conn.execute("UPDATE links SET status = 'ok', next_check_at = ? WHERE id = ?", (past, ok_id))
+    conn.commit()
+
+    count = pull_forward_ok_links(conn, datetime.now(UTC))
+    assert count == 0  # already due, nothing to pull forward
+
+    row = conn.execute("SELECT next_check_at FROM links WHERE id = ?", (ok_id,)).fetchone()
     assert row["next_check_at"] == past  # left alone
 
 
