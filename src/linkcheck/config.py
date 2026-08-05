@@ -312,7 +312,7 @@ CHECK_PER_DOMAIN_CONCURRENCY = 3
 CHECK_PER_DOMAIN_MIN_INTERVAL_SECONDS = 0.5  # min spacing between request *starts* to
                                               # one host, independent of concurrency -
                                               # caps sustained rate, not just simultaneity
-CHECK_TIMEOUT_SECONDS = 15
+CHECK_TIMEOUT_SECONDS = 60
 CHECK_MAX_REDIRECTS = 10
 
 # Extended "webpage rot" detection (parked domains, soft-404 pages, redirects
