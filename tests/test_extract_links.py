@@ -413,6 +413,71 @@ def test_extract_links_same_host_exclusion_is_case_insensitive():
     assert links == []
 
 
+def test_extract_links_captures_iframe_embed_with_title_as_link_text():
+    html = '<iframe title="How Photosynthesis Works" src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>'
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert len(links) == 1
+    assert links[0].url == "https://www.youtube.com/embed/dQw4w9WgXcQ"
+    assert links[0].text == "How Photosynthesis Works"
+
+
+def test_extract_links_iframe_embed_real_world_jetpack_markup():
+    # a real Jetpack-rendered video embed (the [youtube] shortcode expands to this) -
+    # no <a href> anywhere near the video, only the iframe's src. This is the shape
+    # that was silently invisible to extract_links before iframe support was added.
+    html = (
+        '<div class="jetpack-video-wrapper"><span class="embed-youtube" style="text-align:center; display: block;">'
+        '<iframe class="youtube-player" width="636" height="358" '
+        'src="https://www.youtube.com/embed/wmkLmOT3UTQ?version=3&#038;rel=1&#038;showsearch=0" '
+        'allowfullscreen="true" style="border:0;"></iframe></span></div>'
+    )
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert [link.url for link in links] == [
+        "https://www.youtube.com/embed/wmkLmOT3UTQ?version=3&rel=1&showsearch=0"
+    ]
+
+
+def test_extract_links_iframe_without_title_falls_back_to_generic_label():
+    html = '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>'
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert len(links) == 1
+    assert links[0].text  # never blank, unlike a text-less <a> which is dropped entirely
+
+
+def test_extract_links_iframe_excluded_if_same_host():
+    html = '<iframe src="/embedded-widget/"></iframe>'
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert links == []
+
+
+def test_extract_links_iframe_with_no_src_is_skipped():
+    html = '<iframe></iframe><a href="https://ext.example.com/x">real link</a>'
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert [link.url for link in links] == ["https://ext.example.com/x"]
+
+
+def test_extract_links_iframe_placeholder_src_is_skipped():
+    # lazy-load stubs and empty ad slots are never real content to track
+    html = """
+    <iframe src="about:blank"></iframe>
+    <iframe src="data:text/html,<p>placeholder</p>"></iframe>
+    <a href="https://ext.example.com/x">real link</a>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    assert [link.url for link in links] == ["https://ext.example.com/x"]
+
+
+def test_extract_links_iframe_day_context_tracks_nearest_preceding_marker():
+    html = """
+    <div id="day1"><strong>Lesson 1</strong><iframe src="https://www.youtube.com/embed/aaaaaaaaaaa"></iframe></div>
+    <div id="day2"><strong>Lesson 2</strong><iframe src="https://www.youtube.com/embed/bbbbbbbbbbb"></iframe></div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    by_url = {link.url: link for link in links}
+    assert by_url["https://www.youtube.com/embed/aaaaaaaaaaa"].day_context == "day1"
+    assert by_url["https://www.youtube.com/embed/bbbbbbbbbbb"].day_context == "day2"
+
+
 def test_extract_internal_links_keeps_only_same_host():
     html = """
     <a href="https://mysite.example.com/day-1/">internal</a>
@@ -488,3 +553,27 @@ def test_extract_internal_links_same_host_check_is_case_insensitive():
         html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
     )
     assert urls == ["https://MySite.Example.com/day-1"]
+
+
+def test_extract_internal_links_includes_iframe_src():
+    html = '<iframe src="/embedded-page/"></iframe>'
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == ["https://mysite.example.com/embedded-page"]
+
+
+def test_extract_internal_links_ignores_external_iframe_src():
+    html = '<iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ"></iframe>'
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == []
+
+
+def test_extract_internal_links_drops_iframe_placeholder_src():
+    html = '<iframe src="about:blank"></iframe><iframe src="data:text/html,<p>x</p>"></iframe>'
+    urls = extract_internal_links(
+        html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com"
+    )
+    assert urls == []

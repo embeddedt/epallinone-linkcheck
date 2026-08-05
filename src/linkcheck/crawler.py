@@ -58,6 +58,27 @@ def _visible_text(tag: Tag) -> str:
     return _WHITESPACE_RE.sub(" ", tag.get_text()).strip()
 
 
+# Prefixes that make a target not worth tracking as a link at all, shared by both
+# <a href> and <iframe src> extraction below. "about:blank"/"data:" only ever show up
+# on iframes in practice (a lazy-load stub, an inline ad slot) but are harmless to
+# check for on an <a> too - no real course link uses either scheme.
+_SKIP_TARGET_PREFIXES = ("#", "mailto:", "tel:", "javascript:", "about:", "data:")
+
+
+def _iframe_label(node: Tag) -> str:
+    """Best-effort human-readable label for an iframe embed (a YouTube/Vimeo video,
+    most commonly) standing in for the anchor text an `<a>` would have.
+
+    An iframe has no visible text of its own to fall back on, so unlike a bare `<a>`
+    (dropped entirely when it has no visible text - see extract_links's docstring),
+    a generic placeholder is used instead of dropping it: an iframe embed is still
+    exactly one identifiable resource on the page, with none of the
+    which-icon-was-it disambiguation problem a text-less anchor has. Prefers the
+    iframe's own accessible `title` attribute when the page author set one.
+    """
+    return (node.get("title") or "").strip() or "(embedded iframe)"
+
+
 def _fix_missing_slash(url: str) -> str:
     """Browsers silently repair `http:/host/path` (single slash after the scheme,
     a typo source pages actually contain) into `http://host/path` - normalize the
@@ -461,6 +482,12 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     extraction itself - `content.rendered` already excludes theme chrome, so
     every `<a href>` in it is course content.
 
+    `<iframe src>` counts as a link too, on equal footing with `<a href>` - a
+    WordPress-embedded YouTube (or other) video renders as an iframe with no `<a>`
+    anywhere near it, so treating only `<a href>` as "a link" silently drops every
+    embedded video from the check queue entirely (see _iframe_label for how such a
+    link's text, which an iframe has none of, is derived instead).
+
     Day context (the nearest preceding `id="dayN"` or `id="weekN"` - the latter is the
     PE/Health, Art, Music, and Computer courses' convention instead of numbering by day -
     however it's marked up: `<div id="dayN">` on one site, `<strong id="dayN">` on
@@ -552,10 +579,11 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
             if node_id != current_day:
                 current_day_label = _day_label(node)
             current_day = node_id
-        if node.name != "a":
+        if node.name not in ("a", "iframe"):
             continue
-        href = (node.get("href") or "").strip()
-        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+        attr = "href" if node.name == "a" else "src"
+        href = (node.get(attr) or "").strip()
+        if not href or href.startswith(_SKIP_TARGET_PREFIXES):
             continue
         try:
             absolute = _fix_missing_slash(urljoin(page_url, href)).split("#", 1)[0]
@@ -563,11 +591,11 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
         except ValueError:
             # e.g. a stray "[" in the href makes urlsplit think it's a malformed
             # IPv6 host literal and raise - not worth failing the whole crawl over.
-            logger.warning("Skipping malformed href %r found on page %s", href, page_url)
+            logger.warning("Skipping malformed %s %r found on page %s", attr, href, page_url)
             continue
         if not absolute or host == base_host:
             continue
-        link_text = _visible_text(node)
+        link_text = _visible_text(node) if node.name == "a" else _iframe_label(node)
         if not link_text:
             continue  # image-only/icon anchors with no visible text aren't worth reporting on
         day_context = current_day if current_day and day_id_counts[current_day] == 1 else None
@@ -589,8 +617,8 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
 def extract_internal_links(html: str, page_url: str, site_base_url: str) -> list[str]:
     """Pull every same-host link out of a page's rendered body, for crawl_site's BFS
     over the course-linked page graph - the mirror image of extract_links, which keeps
-    only the opposite (different-host) half of the same `<a href>` set and is what
-    actually gets checked/reported on.
+    only the opposite (different-host) half of the same `<a href>`/`<iframe src>` set
+    and is what actually gets checked/reported on.
 
     A same-page anchor jump back to this exact page (fragment-only, or an absolute href
     that resolves to this same URL once the fragment is stripped) is excluded rather
@@ -609,9 +637,10 @@ def extract_internal_links(html: str, page_url: str, site_base_url: str) -> list
     page_no_frag = page_url.split("#", 1)[0].rstrip("/")
 
     seen: dict[str, None] = {}
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+    for node in soup.find_all(("a", "iframe")):
+        attr = "href" if node.name == "a" else "src"
+        href = (node.get(attr) or "").strip()
+        if not href or href.startswith(_SKIP_TARGET_PREFIXES):
             continue
         try:
             absolute = _fix_missing_slash(urljoin(page_url, href))
@@ -619,7 +648,7 @@ def extract_internal_links(html: str, page_url: str, site_base_url: str) -> list
         except ValueError:
             # e.g. a stray "[" in the href makes urlsplit think it's a malformed
             # IPv6 host literal and raise - not worth failing the whole crawl over.
-            logger.warning("Skipping malformed href %r found on page %s", href, page_url)
+            logger.warning("Skipping malformed %s %r found on page %s", attr, href, page_url)
             continue
         if host != base_host:
             continue
