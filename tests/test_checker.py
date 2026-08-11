@@ -72,11 +72,15 @@ def test_classify_200_is_ok():
     assert classify("https://x.test/a", _result(200)) == Classification("ok", None)
 
 
-def test_classify_other_error_status_is_ok_for_now():
-    # 404 and 410 are the only broken statuses today; 403 (often bot-blocking) and 5xx
-    # (often transient) are deliberately left ok - this is what changes if the
-    # definition of "broken" is extended later
-    assert classify("https://x.test/a", _result(500)) == Classification("ok", None)
+def test_classify_5xx_is_broken():
+    assert classify("https://x.test/a", _result(500)) == Classification("broken", None)
+    assert classify("https://x.test/a", _result(503)) == Classification("broken", None)
+
+
+def test_classify_403_is_ok_for_now():
+    # 403 (often bot-blocking a scraper that a student's browser reaches fine) is
+    # deliberately left ok - this is what changes if the definition of "broken" is
+    # extended later
     assert classify("https://x.test/a", _result(403)) == Classification("ok", None)
 
 
