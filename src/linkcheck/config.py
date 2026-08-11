@@ -96,13 +96,22 @@ class HostBlacklistRule:
         return f"AND {host_column} NOT IN ({placeholders})", params
 
 
+
+# Enclosing punctuation stripped from link_text (both ends) before a
+# LinkTextBlacklistRule comparison - covers common human slips like a stray
+# "(source" (unmatched paren left inside the anchor) or "source:"/"source." -
+# without stripping *interior* characters, so "Resource"/"outsource" etc. can
+# never collapse down to "source" by accident.
+_CITATION_STRIP_CHARS = "()[]{}.,:;!?\"'"
+
+
 @dataclass(frozen=True)
 class LinkTextBlacklistRule:
     key: str
     label: str
     reason: str
     kind: str  # "link text" - display-only
-    values: frozenset[str]  # trimmed/lowercased link_text values to exclude
+    values: frozenset[str]  # trimmed/lowercased/punctuation-stripped link_text values to exclude
 
     def sql_clause(
         self, *, host_column: str = "host", link_id_column: str = "links.id"
@@ -113,12 +122,16 @@ class LinkTextBlacklistRule:
         placeholders = ",".join(f":{name}" for name in params)
         alias = f"{self.key}_pl"  # derived from key, not hardcoded, so two link-text
         # rules folded into one combined clause can never alias-collide
+        # SQL-escape any embedded single quote (e.g. an apostrophe in the strip set)
+        # by doubling it, per SQLite string-literal syntax.
+        strip_literal = _CITATION_STRIP_CHARS.replace("'", "''")
+        normalized = f"TRIM(TRIM(LOWER({alias}.link_text)), '{strip_literal}')"
         return (
             f"""AND EXISTS (
                 SELECT 1 FROM page_links {alias}
                 WHERE {alias}.link_id = {link_id_column}
                   AND ({alias}.link_text IS NULL
-                       OR TRIM(LOWER({alias}.link_text)) NOT IN ({placeholders}))
+                       OR {normalized} NOT IN ({placeholders}))
             )""",
             params,
         )
@@ -192,6 +205,20 @@ BLACKLIST_RULES: tuple[
         ),
     ),
     HostBlacklistRule(
+        key="dead_host_with_alternate",
+        label="Dead hosts, alternate link added beside them",
+        kind="host",
+        values=frozenset({"123teachme.com", "www.123teachme.com", "apstudynotes.org", "www.apstudynotes.org"}),
+        reason=(
+            "Appears to be permanently gone - course pages have started pairing "
+            "these links with an explicit \"(alternate link)\" backup (usually "
+            "web.archive.org, itself in never_check_host) right next to them "
+            "instead of fixing the original. Excluded rather than left to flag as "
+            "broken forever; revisit once checking can follow the alternate "
+            "instead of the dead original."
+        ),
+    ),
+    HostBlacklistRule(
         key="login_required_host",
         label="Login-required hosts",
         kind="host",
@@ -218,14 +245,17 @@ BLACKLIST_RULES: tuple[
         key="source_citation",
         label="Source-citation link text",
         kind="link text",
-        values=frozenset({"source", "source)", "(source)"}),
+        values=frozenset({"source"}),
         reason=(
             "Anchor text marking a citation/attribution link (\"here's where we got "
             "this lesson material from\"), not a link students are meant to click - "
             "both sites pair these with an explicit \"do not click\" disclaimer. "
-            "Never checked, and only excluded when every reference to the link uses "
-            "this text - a link cited as \"source\" on one page but a real course "
-            "link on another must still show up as a problem."
+            "Matched after stripping enclosing punctuation, so \"(source\", "
+            "\"source)\", \"(source)\", and \"source:\" all count as this text too - "
+            "common human slips (an unmatched paren, a trailing colon) rather than a "
+            "different link. Never checked, and only excluded when every reference "
+            "to the link uses this text - a link cited as \"source\" on one page but "
+            "a real course link on another must still show up as a problem."
         ),
     ),
 )

@@ -172,7 +172,9 @@ def test_get_problem_links_excludes_orphaned_links(conn):
     assert report.get_problem_links(conn) == []
 
 
-@pytest.mark.parametrize("text", ["source", "Source", "(source)", "source)", "  source  "])
+@pytest.mark.parametrize(
+    "text", ["source", "Source", "(source)", "source)", "  source  ", "(source", "source:", "[source]"]
+)
 def test_get_problem_links_excludes_source_citation_links(conn, text):
     # Both sites mark citation/attribution links with literal anchor text "source"
     # (styled and disclaimed as "do not click" in the page content itself) - these
@@ -187,6 +189,20 @@ def test_get_problem_links_excludes_source_citation_links(conn, text):
     summaries = {(s.slug, s.kind): s for s in report.get_site_summaries(conn)}
     assert summaries[("homeschool", "course")].broken == 0
     assert summaries[("homeschool", "course")].total == 0
+
+
+@pytest.mark.parametrize("text", ["Resource", "outsource", "see source", "sources"])
+def test_get_problem_links_does_not_over_match_source_citation_rule(conn, text):
+    # Punctuation is stripped from both ends before comparing (see
+    # config._CITATION_STRIP_CHARS), but the inner text must still be the exact
+    # word "source" - text that merely contains it as a substring is a real link.
+    _sync(
+        conn, "homeschool", "math-1", "https://allinonehomeschool.com/math-1/",
+        [ExtractedLink(url="https://ext.example.com/citation", text=text, day_context=None)],
+    )
+    _confirm_broken(conn)
+
+    assert len(report.get_problem_links(conn)) == 1
 
 
 def test_get_problem_links_keeps_source_text_link_if_used_as_a_real_link_elsewhere(conn):
