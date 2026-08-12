@@ -534,15 +534,40 @@ def extract_links(html: str, page_url: str, site_base_url: str) -> list[Extracte
     bogus "day1" occurrences (tripping the duplicate-id guard below for lesson 1 itself)
     and, since descendants are visited outer-then-inner, overwrite current_day with that
     spurious inner id right after the real outer one was set - so `_is_nested_marker`
-    ignores any id-bearing tag that sits inside another id-bearing tag, keeping only the
-    outer (real) marker. This is separate from - and does not affect - the genuine
-    duplicate-id case just below, which is about sibling markers, not nested ones.
+    ignores a nested id-bearing tag whose id the page also uses elsewhere, keeping only
+    the outer (real) marker. It deliberately does *not* ignore every nested marker: a
+    uniquely numbered one nested only because an earlier lesson's `<div>` was never
+    closed is a real lesson, and must still advance current_day (see _is_nested_marker).
+    This is separate from - and does not affect - the genuine duplicate-id case just
+    below, which is about sibling markers, not nested ones.
     """
     soup = BeautifulSoup(html, "lxml")
     base_host = urlparse(site_base_url).netloc.lower()
 
+    # How many marker tags carry each id, counting nested ones too - the discriminator
+    # for _is_nested_marker below.
+    marker_id_totals = Counter(node.get("id") for node in soup.find_all(id=DAY_ID_RE))
+
     def _is_nested_marker(node: Tag) -> bool:
-        return node.find_parent(id=DAY_ID_RE) is not None
+        """Whether an id-bearing tag inside another one is the spurious copy-paste
+        leftover described above, rather than a real lesson.
+
+        Nesting alone can't tell them apart, because a *third* markup shape produces
+        the same tree: an unclosed `<div id="dayN">` (a stray extra `<div>` inside the
+        lesson eats the closing tag) swallows every later lesson on the page as its
+        descendants. Treating those as nested froze current_day at the break for the
+        rest of the page - e.g. Reading 2's Lesson 35 absorbed lessons 36-180, so 219
+        links reported "Lesson 35", and Bible New Testament mislabeled 655.
+
+        The leftover always duplicates an id the page already uses for a real lesson
+        (it's a copy of Lesson 1's marker), while a lesson swallowed by unclosed markup
+        keeps its own unique number - so require the id to appear more than once before
+        discarding it. The real outer marker is never nested, so it is never a
+        candidate here regardless of how often its id repeats.
+        """
+        if node.find_parent(id=DAY_ID_RE) is None:
+            return False
+        return marker_id_totals[node.get("id")] > 1
 
     def _marker_run_counts(marker_nodes: list[Tag]) -> Counter:
         """Count contiguous runs of each id among marker_nodes (already in document

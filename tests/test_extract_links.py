@@ -292,6 +292,41 @@ def test_extract_links_ignores_spurious_nested_marker_left_over_from_copy_paste(
     assert by_url["https://ext.example.com/lesson3"].day_label == "Lesson 3"
 
 
+def test_extract_links_keeps_lessons_swallowed_by_an_unclosed_marker_div():
+    # real markup seen on reading-2 (and 12 other pages): a stray extra <div> inside
+    # Lesson 35 eats that lesson's closing tag, so every later lesson parses as a
+    # *descendant* of day35 rather than its sibling. Those are real, uniquely numbered
+    # lessons - unlike the copy-paste day1 leftover above, whose id the page reuses -
+    # so they must still advance day_context instead of being written off as nested.
+    # Left unfixed this froze the marker at the break for the rest of the page (219
+    # links reported "Lesson 35" on reading-2 alone; 655 reported "Lesson 14" on Bible
+    # New Testament).
+    html = """
+    <div id="day34"><p><strong>Lesson 34</strong></p>
+      <ol><li><a href="https://ext.example.com/before">before</a></li></ol>
+    </div>
+    <div id="day35"><p><strong>Lesson 35</strong></p>
+      <div>
+      <ol><li><a href="https://ext.example.com/inside35">inside35</a></li></ol>
+      </div>
+    <div id="day36"><p><strong>Lesson 36</strong></p>
+      <ol><li><a href="https://ext.example.com/after36">after36</a></li></ol>
+    </div>
+    <div id="day37"><p><strong>Lesson 37</strong></p>
+      <ol><li><a href="https://ext.example.com/after37">after37</a></li></ol>
+    </div>
+    """
+    links = extract_links(html, page_url="https://mysite.example.com/course/", site_base_url="https://mysite.example.com")
+    by_url = {link.url: link for link in links}
+    assert by_url["https://ext.example.com/before"].day_context == "day34"
+    assert by_url["https://ext.example.com/inside35"].day_context == "day35"
+    # the swallowed lessons keep their own numbers rather than inheriting day35's
+    assert by_url["https://ext.example.com/after36"].day_context == "day36"
+    assert by_url["https://ext.example.com/after36"].day_label == "Lesson 36"
+    assert by_url["https://ext.example.com/after37"].day_context == "day37"
+    assert by_url["https://ext.example.com/after37"].day_label == "Lesson 37"
+
+
 def test_extract_links_keeps_one_occurrence_per_day_for_a_repeated_url():
     # the same resource (a shared reference site, a recurring game) linked from more
     # than one day section is a distinct occurrence per day, not a single link to
