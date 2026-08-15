@@ -70,8 +70,9 @@ CRAWL_RATE_LIMIT_BASE_DELAY_SECONDS = 5.0  # doubles each retry; used only when 
 
 # --- check phase / reporting ---
 # Standardized "never check, never show up" rules. Each rule declares its own SQL
-# predicate (a plain host NOT IN for HostBlacklistRule, a correlated EXISTS over
-# page_links.link_text for LinkTextBlacklistRule) but shares the same fields/method
+# predicate (a plain host NOT IN for HostBlacklistRule, an exact-or-subdomain NOT
+# for HostSuffixBlacklistRule, a correlated EXISTS over page_links.link_text for
+# LinkTextBlacklistRule) but shares the same fields/method
 # shape, so exclusion_clause() below can fold any number/mix of rules into one
 # combined WHERE-clause fragment without needing to know which kind it's holding.
 # Splice the result into any query that has a host column and links.id in scope -
@@ -95,6 +96,35 @@ class HostBlacklistRule:
         placeholders = ",".join(f":{name}" for name in params)
         return f"AND {host_column} NOT IN ({placeholders})", params
 
+
+@dataclass(frozen=True)
+class HostSuffixBlacklistRule:
+    key: str  # slug: namespaces this rule's SQL param names, avoiding collisions
+    label: str  # short display name, for the dashboard
+    reason: str  # human sentence, for the dashboard
+    kind: str  # "host suffix" - display-only, no logic depends on it
+    values: frozenset[str]  # base domains; matches the domain itself and any subdomain
+
+    def sql_clause(
+        self, *, host_column: str = "host", link_id_column: str = "links.id"
+    ) -> tuple[str, dict[str, str]]:
+        # Exact-match HostBlacklistRule can't cover a domain whose subdomains are
+        # numerous/arbitrary (e.g. archive.org's per-item ia*/dn* content-node
+        # shards) - each domain here matches itself plus "%.{domain}" so any
+        # subdomain is covered without enumerating hosts that don't exist yet. The
+        # leading "." in the LIKE pattern means "myarchive.org"/"archive.org.evil.com"
+        # never collide with a real "archive.org" subdomain.
+        if not self.values:
+            return "", {}
+        conditions = []
+        params: dict[str, str] = {}
+        for i, domain in enumerate(self.values):
+            exact_param = f"{self.key}_{i}_exact"
+            suffix_param = f"{self.key}_{i}_suffix"
+            conditions.append(f"({host_column} = :{exact_param} OR {host_column} LIKE :{suffix_param})")
+            params[exact_param] = domain
+            params[suffix_param] = f"%.{domain}"
+        return f"AND NOT ({' OR '.join(conditions)})", params
 
 
 # Enclosing punctuation stripped from link_text (both ends) before a
@@ -180,7 +210,12 @@ class PageBlacklistRule:
 
 
 BLACKLIST_RULES: tuple[
-    HostBlacklistRule | LinkTextBlacklistRule | PageBlacklistRule | LinkUrlBlacklistRule, ...
+    HostBlacklistRule
+    | HostSuffixBlacklistRule
+    | LinkTextBlacklistRule
+    | PageBlacklistRule
+    | LinkUrlBlacklistRule,
+    ...,
 ] = (
     PageBlacklistRule(
         key="parent_submitted_pages",
@@ -193,15 +228,18 @@ BLACKLIST_RULES: tuple[
             "page also reachable via a real course page stays in scope."
         ),
     ),
-    HostBlacklistRule(
-        key="never_check_host",
-        label="Never-checked hosts",
-        kind="host",
-        values=frozenset({"web.archive.org"}),
+    HostSuffixBlacklistRule(
+        key="never_check_archive_org",
+        label="Never-checked hosts (archive.org and subdomains)",
+        kind="host suffix",
+        values=frozenset({"archive.org"}),
         reason=(
-            "Chronically slow/timeout-prone; each attempt burns the full request "
-            "timeout for no benefit. Still crawled and stored, just never due for a "
-            "check."
+            "web.archive.org (Wayback Machine) is chronically slow/timeout-prone; "
+            "each attempt burns the full request timeout for no benefit. The rest of "
+            "archive.org - www.archive.org, the bare apex, and the per-item ia*/dn* "
+            "content-node shards item downloads redirect to - are excluded alongside "
+            "it rather than left to flag as broken. Still crawled and stored, just "
+            "never due for a check."
         ),
     ),
     HostBlacklistRule(
@@ -212,7 +250,7 @@ BLACKLIST_RULES: tuple[
         reason=(
             "Appears to be permanently gone - course pages have started pairing "
             "these links with an explicit \"(alternate link)\" backup (usually "
-            "web.archive.org, itself in never_check_host) right next to them "
+            "web.archive.org, itself in never_check_archive_org) right next to them "
             "instead of fixing the original. Excluded rather than left to flag as "
             "broken forever; revisit once checking can follow the alternate "
             "instead of the dead original."

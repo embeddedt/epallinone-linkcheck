@@ -468,7 +468,7 @@ def test_render_html_report_no_other_pages_divider_when_all_course(conn):
 def test_dashboard_shows_blacklist_configuration():
     html = report.render_html_report([], [])
     assert "Never-checked hosts" in html
-    assert "web.archive.org" in html
+    assert "archive.org" in html
     assert "Source-citation link text" in html
 
 
