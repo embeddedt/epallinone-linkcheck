@@ -156,6 +156,10 @@ class LinkTextBlacklistRule:
         # by doubling it, per SQLite string-literal syntax.
         strip_literal = _CITATION_STRIP_CHARS.replace("'", "''")
         normalized = f"TRIM(TRIM(LOWER({alias}.link_text)), '{strip_literal}')"
+        # EXISTS a page_links row NOT matching the blacklisted text, rather than a
+        # blanket NOT IN on links.link_text: only excludes when every reference to
+        # the link uses this text - a link cited as "source" on one page but a real
+        # course link on another must still show up as a problem.
         return (
             f"""AND EXISTS (
                 SELECT 1 FROM page_links {alias}
@@ -209,6 +213,9 @@ class PageBlacklistRule:
         return "", {}
 
 
+# Keep each rule's `reason` to 1 sentence, 2 at most - it's dashboard-facing prose,
+# not a design doc. Implementation nuance (matching quirks, SQL details) belongs in a
+# code comment near the relevant dataclass/field instead.
 BLACKLIST_RULES: tuple[
     HostBlacklistRule
     | HostSuffixBlacklistRule
@@ -223,9 +230,8 @@ BLACKLIST_RULES: tuple[
         kind="page",
         values=frozenset({"parent-submitted-courses", "foresensics-parent-submitted"}),
         reason=(
-            "User-submitted course content, not maintained curriculum - these pages, "
-            "and any page reachable only through them, are never crawled at all. A "
-            "page also reachable via a real course page stays in scope."
+            "User-submitted course content, not maintained curriculum - never "
+            "crawled, along with anything reachable only through them."
         ),
     ),
     HostSuffixBlacklistRule(
@@ -235,11 +241,8 @@ BLACKLIST_RULES: tuple[
         values=frozenset({"archive.org"}),
         reason=(
             "web.archive.org (Wayback Machine) is chronically slow/timeout-prone; "
-            "each attempt burns the full request timeout for no benefit. The rest of "
-            "archive.org - www.archive.org, the bare apex, and the per-item ia*/dn* "
-            "content-node shards item downloads redirect to - are excluded alongside "
-            "it rather than left to flag as broken. Still crawled and stored, just "
-            "never due for a check."
+            "the rest of archive.org is excluded alongside it since links can land "
+            "on any of its subdomains."
         ),
     ),
     HostBlacklistRule(
@@ -249,11 +252,9 @@ BLACKLIST_RULES: tuple[
         values=frozenset({"123teachme.com", "www.123teachme.com", "apstudynotes.org", "www.apstudynotes.org"}),
         reason=(
             "Appears to be permanently gone - course pages have started pairing "
-            "these links with an explicit \"(alternate link)\" backup (usually "
-            "web.archive.org, itself in never_check_archive_org) right next to them "
-            "instead of fixing the original. Excluded rather than left to flag as "
-            "broken forever; revisit once checking can follow the alternate "
-            "instead of the dead original."
+            "these with an explicit \"(alternate link)\" backup instead of fixing "
+            "the original, so it's excluded rather than left to flag as broken "
+            "forever."
         ),
     ),
     HostBlacklistRule(
@@ -267,6 +268,17 @@ BLACKLIST_RULES: tuple[
             "check response here is never meaningful."
         ),
     ),
+    HostBlacklistRule(
+        key="unreachable_from_checker_host",
+        label="Blocked from the checker's network",
+        kind="host",
+        values=frozenset({"docsouth.unc.edu"}),
+        reason=(
+            "Confirmed by hand to fail with \"No route to host\" - a network-level "
+            "block between the checker's host and UNC's network, not a real outage, "
+            "so a check here is never meaningful."
+        ),
+    ),
     LinkUrlBlacklistRule(
         key="rot_false_positive",
         label="Rot false positives",
@@ -274,9 +286,7 @@ BLACKLIST_RULES: tuple[
         values=frozenset({"https://adblockplus.org/en/chrome"}),
         reason=(
             "Confirmed by hand to redirect somewhere still useful - the "
-            "homepage_redirect heuristic (rot.py) flags it anyway, so it's excluded "
-            "individually rather than tuning the heuristic and risking new false "
-            "negatives elsewhere."
+            "homepage_redirect heuristic (rot.py) flags it anyway."
         ),
     ),
     LinkTextBlacklistRule(
@@ -285,15 +295,9 @@ BLACKLIST_RULES: tuple[
         kind="link text",
         values=frozenset({"source"}),
         reason=(
-            "Anchor text marking a citation/attribution link (\"here's where we got "
-            "this lesson material from\"), not a link students are meant to click - "
-            "both sites pair these with an explicit \"do not click\" disclaimer. "
-            "Matched after stripping enclosing punctuation, so \"(source\", "
-            "\"source)\", \"(source)\", and \"source:\" all count as this text too - "
-            "common human slips (an unmatched paren, a trailing colon) rather than a "
-            "different link. Never checked, and only excluded when every reference "
-            "to the link uses this text - a link cited as \"source\" on one page but "
-            "a real course link on another must still show up as a problem."
+            "Anchor text marking a citation/attribution link, not a link students "
+            "are meant to click - both sites pair these with an explicit \"do not "
+            "click\" disclaimer."
         ),
     ),
 )
