@@ -51,8 +51,19 @@ CREATE TABLE IF NOT EXISTS links (
     last_broken_reason TEXT,               -- rot.py reason slug (e.g. 'homepage_redirect')
                                             -- when the most recent check's classify() call
                                             -- flagged a 2xx as broken anyway; NULL otherwise
+    last_error_detail TEXT,                -- str(exc) from the most recent check's failure,
+                                            -- when last_error_type is set (see
+                                            -- checker.CheckResult.error_detail) - what actually
+                                            -- distinguishes e.g. a host-unreachable network
+                                            -- block from a generic "other" failure
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'pending' -- pending | ok | broken | unreachable
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | ok | broken | unreachable
+    status_changed_at TEXT                 -- when `status` last changed value; NULL until the
+                                            -- first check moves it off the initial 'pending'.
+                                            -- Distinct from consecutive_failures, which clamps
+                                            -- at the confirm threshold (see checker.next_state)
+                                            -- and so can't tell "confirmed yesterday" apart from
+                                            -- "confirmed a month ago" - this can.
 );
 CREATE INDEX IF NOT EXISTS idx_links_next_check ON links(next_check_at);
 CREATE INDEX IF NOT EXISTS idx_links_host ON links(host);
@@ -110,9 +121,11 @@ CREATE TABLE IF NOT EXISTS link_checks (
     page_title TEXT,                       -- <title> text from a capped 2xx html body sample
                                             -- (see checker._read_body_sample); NULL when the
                                             -- response wasn't a 2xx html page, or had no title
-    broken_reason TEXT                     -- rot.py reason slug when classify() flagged this
+    broken_reason TEXT,                    -- rot.py reason slug when classify() flagged this
                                             -- check broken via rot detection rather than a
                                             -- plain 404/410 or network failure; NULL otherwise
+    error_detail TEXT                      -- str(exc) when error_type is set (see
+                                            -- checker.CheckResult.error_detail); NULL otherwise
 );
 CREATE INDEX IF NOT EXISTS idx_link_checks_link ON link_checks(link_id, checked_at);
 

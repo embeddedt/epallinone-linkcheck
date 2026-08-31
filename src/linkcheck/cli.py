@@ -307,7 +307,14 @@ def confirm_broken_command(db_path: str) -> None:
     type=click.Path(dir_okay=False),
     help="Also render a static HTML dashboard to this path.",
 )
-def report_command(db_path: str, html_path: str | None) -> None:
+@click.option(
+    "--json",
+    "json_path",
+    default=None,
+    type=click.Path(dir_okay=False),
+    help="Also write a JSON export of confirmed broken/unreachable links to this path.",
+)
+def report_command(db_path: str, html_path: str | None, json_path: str | None) -> None:
     """Print a text report of current link status, and optionally a static HTML dashboard."""
     conn = db.connect(db_path)
     try:
@@ -321,6 +328,11 @@ def report_command(db_path: str, html_path: str | None) -> None:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(html)
             click.echo(f"\nWrote HTML dashboard to {html_path}")
+        if json_path:
+            out_path = Path(json_path)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(report.render_json_report(problem_links))
+            click.echo(f"\nWrote JSON export to {json_path}")
     finally:
         conn.close()
 

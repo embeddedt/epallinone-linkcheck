@@ -42,8 +42,12 @@ def init_db(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "link_checks", "final_url", "TEXT")
     _add_column_if_missing(conn, "link_checks", "page_title", "TEXT")
     _add_column_if_missing(conn, "link_checks", "broken_reason", "TEXT")
+    _add_column_if_missing(conn, "link_checks", "error_detail", "TEXT")
     _add_column_if_missing(conn, "links", "last_final_url", "TEXT")
     _add_column_if_missing(conn, "links", "last_broken_reason", "TEXT")
+    _add_column_if_missing(conn, "links", "last_error_detail", "TEXT")
+    _add_column_if_missing(conn, "links", "status_changed_at", "TEXT")
+    _backfill_status_changed_at(conn)
     _migrate_page_links_occurrences(conn, schema)
     _sync_sites(conn)
     conn.commit()
@@ -58,6 +62,49 @@ def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, dd
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+
+
+def _backfill_status_changed_at(conn: sqlite3.Connection) -> None:
+    """`status_changed_at` is only stamped going forward, by record_check, on a real
+    status transition - a link that was already stable (confirmed broken/unreachable/ok)
+    before this column existed has no transition left to trigger that, so it would sit
+    NULL forever rather than just until the next check. That's not "unknown", though -
+    it's derivable from link_checks: walk each link's history backward from most recent
+    and find where the current unbroken run of matching outcomes began. Idempotent
+    (only touches rows still NULL), so this is a no-op after the first run except for
+    links stuck in 'pending' (no outcome to derive a run from - genuinely unknown,
+    left NULL) until they get their first real check.
+    """
+    links_needing_backfill = conn.execute(
+        "SELECT id, status FROM links WHERE status_changed_at IS NULL AND status != 'pending'"
+    ).fetchall()
+    for link in links_needing_backfill:
+        checks = conn.execute(
+            """
+            SELECT checked_at, error_type, classified_broken FROM link_checks
+            WHERE link_id = :link_id ORDER BY checked_at DESC
+            """,
+            {"link_id": link["id"]},
+        ).fetchall()
+        run_start: str | None = None
+        for check in checks:
+            # error_type set is what actually makes a check 'unreachable' (see
+            # checker.classify) - classified_broken only distinguishes 'broken' from
+            # 'ok' among the checks that did complete a request.
+            if link["status"] == "unreachable":
+                matches_current_status = check["error_type"] is not None
+            elif link["status"] == "broken":
+                matches_current_status = check["error_type"] is None and check["classified_broken"] == 1
+            else:  # ok
+                matches_current_status = check["error_type"] is None and check["classified_broken"] == 0
+            if not matches_current_status:
+                break
+            run_start = check["checked_at"]
+        if run_start is not None:
+            conn.execute(
+                "UPDATE links SET status_changed_at = :run_start WHERE id = :id",
+                {"run_start": run_start, "id": link["id"]},
+            )
 
 
 def _migrate_page_links_occurrences(conn: sqlite3.Connection, schema: str) -> None:

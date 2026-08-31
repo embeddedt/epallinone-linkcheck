@@ -13,3 +13,4 @@ wheels/
 *.db*
 .pytest_cache/
 public/status.html
+public/status.json

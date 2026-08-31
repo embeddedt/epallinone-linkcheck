@@ -65,6 +65,12 @@ class CheckResult:
     # own. Persisted (see record_check); body_excerpt below deliberately is not.
     final_url: str | None = None
     page_title: str | None = None
+    # str(exc) from whatever raised, when error_type is set - error_type alone
+    # collapses everything OSError-shaped that _classify_connect_error doesn't have a
+    # specific bucket for into "other", and even a specific bucket like bad_ssl_cert
+    # loses which host/reason the handshake actually failed for. This is what makes a
+    # failure diagnosable after the fact instead of needing to be reproduced by hand.
+    error_detail: str | None = None
     # In-memory only - never written to link_checks. It exists purely to feed
     # rot.detect_rot for this one check; keeping ~4000 chars of page text per row of
     # an append-only history table would bloat it for no benefit once the check is
@@ -407,26 +413,26 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
             "GET", url, headers={"User-Agent": USER_AGENT}, follow_redirects=True
         ) as response:
             return await _result_from_response(response, elapsed_ms())
-    except httpx.TooManyRedirects:
-        return CheckResult(None, ERROR_TOO_MANY_REDIRECTS, elapsed_ms())
-    except httpx.TimeoutException:
-        return CheckResult(None, ERROR_TIMEOUT, elapsed_ms())
+    except httpx.TooManyRedirects as exc:
+        return CheckResult(None, ERROR_TOO_MANY_REDIRECTS, elapsed_ms(), error_detail=str(exc))
+    except httpx.TimeoutException as exc:
+        return CheckResult(None, ERROR_TIMEOUT, elapsed_ms(), error_detail=str(exc))
     except httpx.ConnectError as exc:
         error_type = _classify_connect_error(exc)
         if CHECK_AIA_CHASE and error_type == ERROR_BAD_SSL_CERT:
             chased = await _fetch_via_aia_chase(url)
             if chased is not None:
                 return chased
-        return CheckResult(None, error_type, elapsed_ms())
-    except httpx.RemoteProtocolError:
+        return CheckResult(None, error_type, elapsed_ms(), error_detail=str(exc))
+    except httpx.RemoteProtocolError as exc:
         if CHECK_LENIENT_HTTP_FALLBACK:
             recovered = await _fetch_via_lenient_http_client(url)
             if recovered is not None:
                 return recovered
-        return CheckResult(None, ERROR_OTHER, elapsed_ms())
-    except httpx.RequestError:
-        return CheckResult(None, ERROR_OTHER, elapsed_ms())
-    except ValueError:
+        return CheckResult(None, ERROR_OTHER, elapsed_ms(), error_detail=str(exc))
+    except httpx.RequestError as exc:
+        return CheckResult(None, ERROR_OTHER, elapsed_ms(), error_detail=str(exc))
+    except ValueError as exc:
         # Malformed URLs (e.g. "http:/example.com/..." with a single slash) aren't
         # rejected up front by httpx.URL - they only blow up later, deep in stdlib
         # urllib, when the client happens to have accumulated cookies and tries to
@@ -435,7 +441,7 @@ async def _fetch(client: httpx.AsyncClient, url: str) -> CheckResult:
         # it, the exception escapes to the caller, record_check never runs, and the
         # link's next_check_at never advances, so it gets reclaimed and re-fails on
         # every single poll forever instead of settling into normal backoff.
-        return CheckResult(None, ERROR_OTHER, elapsed_ms())
+        return CheckResult(None, ERROR_OTHER, elapsed_ms(), error_detail=str(exc))
 
 
 def _youtube_oembed_url(video_id: str) -> str:
@@ -837,9 +843,9 @@ def record_check(
             """
             INSERT INTO link_checks
                 (link_id, checked_at, http_status, error_type, response_time_ms,
-                 classified_broken, final_url, page_title, broken_reason)
+                 classified_broken, final_url, page_title, broken_reason, error_detail)
             VALUES (:link_id, :checked_at, :http_status, :error_type, :response_time_ms,
-                    :classified_broken, :final_url, :page_title, :broken_reason)
+                    :classified_broken, :final_url, :page_title, :broken_reason, :error_detail)
             """,
             {
                 "link_id": link.id,
@@ -851,6 +857,7 @@ def record_check(
                 "final_url": result.final_url,
                 "page_title": result.page_title,
                 "broken_reason": classification.reason,
+                "error_detail": result.error_detail,
             },
         )
         conn.execute(
@@ -862,7 +869,14 @@ def record_check(
                 last_error_type = :error_type,
                 last_final_url = :final_url,
                 last_broken_reason = :broken_reason,
+                last_error_detail = :error_detail,
                 consecutive_failures = :consecutive_failures,
+                -- Right-hand expressions here see this row's pre-update values, so
+                -- `status` below is still the OLD status - a real transition (not just
+                -- an unconfirmed failure, which next_state leaves `updated.status`
+                -- equal to the old status for) is the only case that stamps a fresh
+                -- status_changed_at; otherwise the existing value carries forward.
+                status_changed_at = CASE WHEN status != :status THEN :now ELSE status_changed_at END,
                 status = :status
             WHERE id = :id
             """,
@@ -873,6 +887,7 @@ def record_check(
                 "error_type": result.error_type,
                 "final_url": result.final_url,
                 "broken_reason": classification.reason,
+                "error_detail": result.error_detail,
                 "consecutive_failures": updated.consecutive_failures,
                 "status": updated.status,
                 "id": link.id,

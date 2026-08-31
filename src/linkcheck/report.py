@@ -7,6 +7,7 @@ the same data.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
@@ -31,7 +32,8 @@ def _named_in(prefix: str, values: tuple[str, ...]) -> tuple[str, dict[str, str]
 
 _LINK_COLUMNS = """
     id, url, host, status, last_http_status, last_error_type, last_broken_reason,
-    consecutive_failures, last_checked_at, first_seen_at, next_check_at,
+    last_error_detail, consecutive_failures, last_checked_at, first_seen_at,
+    next_check_at, status_changed_at,
     (SELECT sites.slug || ': ' || pages.title
      FROM page_links
      JOIN pages ON pages.id = page_links.page_id
@@ -69,10 +71,13 @@ class LinkReportRow:
     last_http_status: int | None
     last_error_type: str | None
     last_broken_reason: str | None
+    last_error_detail: str | None
     consecutive_failures: int
     last_checked_at: str | None
     first_seen_at: str
     next_check_at: str
+    status_changed_at: str | None  # NULL for a link still 'pending', or from before this
+    # column existed (see db._add_column_if_missing) - never assume it's set.
     pages: list[PageRef]
 
 
@@ -316,10 +321,12 @@ def _rows_with_pages(conn: sqlite3.Connection, link_rows: list) -> list[LinkRepo
             last_http_status=row["last_http_status"],
             last_error_type=row["last_error_type"],
             last_broken_reason=row["last_broken_reason"],
+            last_error_detail=row["last_error_detail"],
             consecutive_failures=row["consecutive_failures"],
             last_checked_at=row["last_checked_at"],
             first_seen_at=row["first_seen_at"],
             next_check_at=row["next_check_at"],
+            status_changed_at=row["status_changed_at"],
             pages=pages_by_link.get(row["id"], []),
         )
         for row in link_rows
@@ -555,4 +562,35 @@ def render_html_report(
         watch_groups=_group_by_page(watch_links),
         blacklist_rules=BLACKLIST_RULES,
         design_exclusions=DESIGN_EXCLUSIONS,
+    )
+
+
+def render_json_report(problem_links: list[LinkReportRow]) -> str:
+    """A small, purpose-built export - not a full DB dump - so anything reading it
+    (a local review skill, ad hoc scripting) doesn't need database access at all, just
+    this URL. Only get_problem_links (confirmed broken/unreachable) rather than
+    get_watch_links too: a link mid the confirm-before-flagging retry schedule hasn't
+    settled into a stable state yet, so there's nothing durable here worth exporting
+    for it. `status_changed_at` is the field that actually matters for spotting a
+    stuck link - `consecutive_failures` alone can't (see LinkReportRow).
+    """
+    return json.dumps(
+        [
+            {
+                "url": link.url,
+                "host": link.host,
+                "status": link.status,
+                "last_http_status": link.last_http_status,
+                "last_error_type": link.last_error_type,
+                "last_broken_reason": link.last_broken_reason,
+                "last_error_detail": link.last_error_detail,
+                "consecutive_failures": link.consecutive_failures,
+                "last_checked_at": link.last_checked_at,
+                "first_seen_at": link.first_seen_at,
+                "status_changed_at": link.status_changed_at,
+                "found_on": sorted({f"{p.site_slug}: {p.page_title}" for p in link.pages}),
+            }
+            for link in problem_links
+        ],
+        indent=2,
     )

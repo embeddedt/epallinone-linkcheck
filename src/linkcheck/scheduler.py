@@ -98,6 +98,14 @@ def _write_dashboard(conn: sqlite3.Connection, dashboard_path: str) -> None:
     tmp.write_text(html)
     os.replace(tmp, path)
 
+    # Published alongside the dashboard, same write-then-rename safety, so anything
+    # reading link status (e.g. a local review skill) can fetch this one small file
+    # instead of needing database access - see report.render_json_report.
+    json_path = path.with_suffix(".json")
+    json_tmp = json_path.with_name(f"{json_path.name}.tmp")
+    json_tmp.write_text(report.render_json_report(problem_links))
+    os.replace(json_tmp, json_path)
+
 
 async def check_loop(
     conn: sqlite3.Connection, stop_event: asyncio.Event, dashboard_path: str
