@@ -102,9 +102,11 @@ def classify(url: str, result: CheckResult) -> Classification:
     reason slug) - the ONLY place "broken" is defined (raw outcomes are stored
     regardless, so extending it later reclassifies history rather than re-checking).
 
-    404 (Not Found), 410 (Gone), and 5xx (server error) are all broken. 403 is
-    deliberately left as `ok`: it's very often bot-blocking a URL a student's browser
-    reaches fine, and flagging it here would mostly manufacture false positives.
+    404 (Not Found), 410 (Gone), and 5xx (server error) are all broken, except 511.
+    403 and 511 are deliberately left as `ok`: 403 is very often bot-blocking a URL a
+    student's browser reaches fine, and 511 (network authentication required) is a
+    browser-check interstitial in front of a page that opens normally, so flagging
+    either would mostly manufacture false positives.
 
     A YouTube video url (check_link routes these through the oEmbed endpoint - see
     rot.youtube_video_id) is checked ahead of both the 403-is-ok default and the
@@ -128,7 +130,9 @@ def classify(url: str, result: CheckResult) -> Classification:
     if CHECK_YOUTUBE_OEMBED and rot.is_unavailable_video(url, result.http_status):
         return Classification(STATUS_BROKEN, rot.REASON_VIDEO_UNAVAILABLE)
     if result.http_status in (404, 410) or (
-        result.http_status is not None and result.http_status >= 500
+        result.http_status is not None
+        and result.http_status >= 500
+        and result.http_status != 511
     ):
         return Classification(STATUS_BROKEN, None)
     if CHECK_YOUTUBE_OEMBED and rot.youtube_video_id(url) is not None:

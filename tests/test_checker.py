@@ -84,6 +84,11 @@ def test_classify_403_is_ok_for_now():
     assert classify("https://x.test/a", _result(403)) == Classification("ok", None)
 
 
+def test_classify_511_is_ok():
+    # browser-check interstitial in front of a page that opens fine for a human
+    assert classify("https://x.test/a", _result(511)) == Classification("ok", None)
+
+
 def test_classify_network_error_is_unreachable_regardless_of_status():
     assert classify("https://x.test/a", _result(None, "timeout")) == Classification(
         "unreachable", None

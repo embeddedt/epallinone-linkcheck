@@ -246,18 +246,6 @@ BLACKLIST_RULES: tuple[
         ),
     ),
     HostBlacklistRule(
-        key="dead_host_with_alternate",
-        label="Dead hosts, alternate link added beside them",
-        kind="host",
-        values=frozenset({"123teachme.com", "www.123teachme.com", "apstudynotes.org", "www.apstudynotes.org"}),
-        reason=(
-            "Appears to be permanently gone - course pages have started pairing "
-            "these with an explicit \"(alternate link)\" backup instead of fixing "
-            "the original, so it's excluded rather than left to flag as broken "
-            "forever."
-        ),
-    ),
-    HostBlacklistRule(
         key="login_required_host",
         label="Login-required hosts",
         kind="host",
